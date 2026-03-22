@@ -1,14 +1,14 @@
+use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, Stream, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_stream::Stream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+use tracing::warn;
 
 use crate::codes;
 use crate::config::ProtocolType;
@@ -16,6 +16,12 @@ use crate::config::ProtocolType;
 // ---------------------------------------------------------------------------
 // Transport trait abstraction
 // ---------------------------------------------------------------------------
+
+/// A boxed, `Send`-able future with a lifetime — shorthand for trait return types.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A transport error.
+pub type TransportError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A frame received from the transport.
 pub enum TransportFrame {
@@ -25,14 +31,8 @@ pub enum TransportFrame {
 
 /// Write half of a transport connection.
 pub trait TransportSink: Send {
-    fn send_data(
-        &mut self,
-        data: Vec<u8>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
-
-    fn close(
-        &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
+    fn send_data(&mut self, data: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>>;
+    fn close(&mut self) -> BoxFuture<'_, Result<(), TransportError>>;
 }
 
 /// A connected transport: sink + stream.
@@ -44,143 +44,14 @@ pub struct TransportConn {
 /// Factory for creating transport connections. Must support multiple `connect()`
 /// calls (the actor reconnects).
 pub trait Transport: Send + Sync {
-    fn connect(
-        &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<TransportConn, String>> + Send + '_>>;
+    fn connect(&self) -> BoxFuture<'_, Result<TransportConn, TransportError>>;
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket transport implementation
+// Disconnect info
 // ---------------------------------------------------------------------------
 
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type WsWriter = SplitSink<WsStream, Message>;
-type WsReader = SplitStream<WsStream>;
-
-/// WebSocket transport for Centrifuge.
-pub struct WsTransport {
-    url: String,
-    protocol_type: ProtocolType,
-}
-
-impl WsTransport {
-    pub fn new(url: String, protocol_type: ProtocolType) -> Self {
-        Self { url, protocol_type }
-    }
-}
-
-impl Transport for WsTransport {
-    fn connect(
-        &self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<TransportConn, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            let mut request = self
-                .url
-                .as_str()
-                .into_client_request()
-                .map_err(|e| format!("invalid URL: {e}"))?;
-
-            if self.protocol_type == ProtocolType::Protobuf {
-                request.headers_mut().insert(
-                    "Sec-WebSocket-Protocol",
-                    HeaderValue::from_static("centrifuge-protobuf"),
-                );
-            }
-
-            let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
-                .await
-                .map_err(|e| format!("websocket connect: {e}"))?;
-
-            let (writer, reader) = ws_stream.split();
-
-            let sink = Box::new(WsSink {
-                writer,
-                protocol_type: self.protocol_type,
-            });
-            let stream: Pin<Box<dyn Stream<Item = TransportFrame> + Send>> =
-                Box::pin(WsStreamAdapter { reader });
-
-            Ok(TransportConn { sink, stream })
-        })
-    }
-}
-
-/// WebSocket sink wrapper.
-struct WsSink {
-    writer: WsWriter,
-    protocol_type: ProtocolType,
-}
-
-impl TransportSink for WsSink {
-    fn send_data(
-        &mut self,
-        data: Vec<u8>,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move {
-            let msg = match self.protocol_type {
-                ProtocolType::Json => {
-                    let text = String::from_utf8(data).map_err(|e| e.to_string())?;
-                    Message::Text(text.into())
-                }
-                ProtocolType::Protobuf => Message::Binary(data.into()),
-            };
-            self.writer
-                .send(msg)
-                .await
-                .map_err(|e| format!("ws send: {e}"))
-        })
-    }
-
-    fn close(
-        &mut self,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        Box::pin(async move {
-            self.writer
-                .close()
-                .await
-                .map_err(|e| format!("ws close: {e}"))
-        })
-    }
-}
-
-/// WebSocket reader adapter that converts `Message` to `TransportFrame`.
-struct WsStreamAdapter {
-    reader: WsReader,
-}
-
-impl Stream for WsStreamAdapter {
-    type Item = TransportFrame;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.reader).poll_next(cx) {
-            Poll::Ready(Some(Ok(msg))) => match msg {
-                Message::Text(text) => {
-                    Poll::Ready(Some(TransportFrame::Data(text.as_bytes().to_vec())))
-                }
-                Message::Binary(bin) => Poll::Ready(Some(TransportFrame::Data(bin.to_vec()))),
-                Message::Close(frame) => {
-                    let info = parse_close_frame(frame);
-                    Poll::Ready(Some(TransportFrame::Close(Some(info))))
-                }
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
-                    // Skip control frames, poll again
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            },
-            Poll::Ready(Some(Err(_))) => Poll::Ready(Some(TransportFrame::Close(None))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Disconnect info and close frame parsing (unchanged)
-// ---------------------------------------------------------------------------
-
-/// Parsed disconnect info extracted from a WebSocket close frame.
+/// Parsed disconnect info.
 #[derive(Debug, Clone)]
 pub struct DisconnectInfo {
     pub code: u32,
@@ -188,30 +59,8 @@ pub struct DisconnectInfo {
     pub reconnect: bool,
 }
 
-/// Extracts disconnect information from a WebSocket close frame.
-pub fn parse_close_frame(frame: Option<CloseFrame>) -> DisconnectInfo {
-    match frame {
-        Some(close) => {
-            let ws_code = close.code.into();
-            if let Ok(advice) = serde_json::from_str::<CloseAdvice>(&close.reason) {
-                return DisconnectInfo {
-                    code: advice.code,
-                    reason: advice.reason,
-                    reconnect: advice.reconnect,
-                };
-            }
-            map_ws_close_code(ws_code, close.reason.to_string())
-        }
-        None => DisconnectInfo {
-            code: codes::connecting::TRANSPORT_CLOSED,
-            reason: "transport closed".into(),
-            reconnect: true,
-        },
-    }
-}
-
-fn map_ws_close_code(ws_code: u16, reason: String) -> DisconnectInfo {
-    match ws_code {
+fn map_close_code(code: u16, reason: String) -> DisconnectInfo {
+    match code {
         1000 | 1001 => DisconnectInfo {
             code: codes::connecting::TRANSPORT_CLOSED,
             reason,
@@ -222,20 +71,29 @@ fn map_ws_close_code(ws_code: u16, reason: String) -> DisconnectInfo {
             reason: "message size limit".into(),
             reconnect: false,
         },
-        code if code >= 3000 => {
-            let reconnect = codes::should_reconnect_on_disconnect(code as u32);
-            DisconnectInfo {
-                code: code as u32,
-                reason,
-                reconnect,
-            }
-        }
+        c if c >= 3000 => DisconnectInfo {
+            code: c as u32,
+            reason,
+            reconnect: codes::should_reconnect_on_disconnect(c as u32),
+        },
         _ => DisconnectInfo {
             code: codes::connecting::TRANSPORT_CLOSED,
-            reason: format!("transport closed with code {ws_code}"),
+            reason: format!("transport closed with code {code}"),
             reconnect: true,
         },
     }
+}
+
+fn parse_close(code: u16, reason: &str) -> DisconnectInfo {
+    // Try JSON disconnect advice first
+    if let Ok(advice) = serde_json::from_str::<CloseAdvice>(reason) {
+        return DisconnectInfo {
+            code: advice.code,
+            reason: advice.reason,
+            reconnect: advice.reconnect,
+        };
+    }
+    map_close_code(code, reason.to_string())
 }
 
 #[derive(serde::Deserialize)]
@@ -248,58 +106,201 @@ struct CloseAdvice {
     reconnect: bool,
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket transport (tokio-tungstenite)
+// ---------------------------------------------------------------------------
+
+/// WebSocket transport for Centrifuge using tokio-tungstenite.
+pub struct WsTransport {
+    url: String,
+    protocol_type: ProtocolType,
+    headers: HashMap<String, String>,
+}
+
+impl WsTransport {
+    pub fn new(url: String, protocol_type: ProtocolType, headers: HashMap<String, String>) -> Self {
+        Self {
+            url,
+            protocol_type,
+            headers,
+        }
+    }
+}
+
+impl Transport for WsTransport {
+    fn connect(&self) -> BoxFuture<'_, Result<TransportConn, TransportError>> {
+        Box::pin(async move {
+            let is_binary = self.protocol_type == ProtocolType::Protobuf;
+
+            let mut request = self
+                .url
+                .as_str()
+                .into_client_request()
+                .map_err(|e| Box::new(e) as TransportError)?;
+
+            if self.protocol_type == ProtocolType::Protobuf {
+                request
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", "centrifuge-protobuf".parse().unwrap());
+            }
+
+            for (key, value) in &self.headers {
+                match (key.parse::<HeaderName>(), value.parse::<HeaderValue>()) {
+                    (Ok(name), Ok(val)) => {
+                        request.headers_mut().insert(name, val);
+                    }
+                    _ => {
+                        warn!(key = %key, "skipping invalid header");
+                    }
+                }
+            }
+
+            let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
+                .await
+                .map_err(|e| Box::new(e) as TransportError)?;
+
+            let (frame_tx, frame_rx) = mpsc::channel::<TransportFrame>(256);
+            let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(256);
+
+            spawn_ws_task(ws_stream, frame_tx, write_rx, is_binary);
+
+            Ok(TransportConn {
+                sink: Box::new(ChannelSink { tx: Some(write_tx) }),
+                stream: Box::pin(ChannelStream { rx: frame_rx }),
+            })
+        })
+    }
+}
+
+/// Spawn a single task that bridges between a tungstenite WebSocketStream
+/// and our channel-based TransportConn interface.
+fn spawn_ws_task<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    frame_tx: mpsc::Sender<TransportFrame>,
+    mut write_rx: mpsc::Receiver<Vec<u8>>,
+    is_binary: bool,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let (mut sink, mut stream) = ws_stream.split();
+
+        // Spawn a dedicated writer task so reads and writes proceed independently.
+        let write_task = tokio::spawn(async move {
+            while let Some(data) = write_rx.recv().await {
+                let msg = if is_binary {
+                    Message::Binary(data.into())
+                } else {
+                    Message::Text(String::from_utf8_lossy(&data).into_owned().into())
+                };
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.close().await;
+        });
+
+        // Reader loop in the current task.
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(Message::Text(t)) => {
+                    if frame_tx
+                        .send(TransportFrame::Data(t.as_bytes().to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Binary(b)) => {
+                    if frame_tx.send(TransportFrame::Data(b.to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(reason)) => {
+                    let info = reason.map(|r| parse_close(u16::from(r.code), &r.reason));
+                    let _ = frame_tx.send(TransportFrame::Close(info)).await;
+                    break;
+                }
+                Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                Err(_) => {
+                    let _ = frame_tx.send(TransportFrame::Close(None)).await;
+                    break;
+                }
+            }
+        }
+
+        write_task.abort();
+    });
+}
+
+struct ChannelSink {
+    tx: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+impl TransportSink for ChannelSink {
+    fn send_data(&mut self, data: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async move {
+            match self.tx {
+                Some(ref tx) => tx.send(data).await.map_err(|e| Box::new(e) as TransportError),
+                None => Err("transport closed".into()),
+            }
+        })
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, Result<(), TransportError>> {
+        self.tx.take();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct ChannelStream {
+    rx: mpsc::Receiver<TransportFrame>,
+}
+
+impl Stream for ChannelStream {
+    type Item = TransportFrame;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[test]
-    fn test_parse_close_frame_with_json_advice() {
-        let frame = CloseFrame {
-            code: CloseCode::Normal,
-            reason: r#"{"code":3001,"reason":"maintenance","reconnect":true}"#.into(),
-        };
-        let info = parse_close_frame(Some(frame));
+    fn test_parse_close_with_json_advice() {
+        let info = parse_close(1000, r#"{"code":3001,"reason":"maintenance","reconnect":true}"#);
         assert_eq!(info.code, 3001);
         assert_eq!(info.reason, "maintenance");
         assert!(info.reconnect);
     }
 
     #[test]
-    fn test_parse_close_frame_terminal_code() {
-        let frame = CloseFrame {
-            code: CloseCode::from(3500),
-            reason: "banned".into(),
-        };
-        let info = parse_close_frame(Some(frame));
+    fn test_parse_close_terminal_code() {
+        let info = parse_close(3500, "banned");
         assert_eq!(info.code, 3500);
         assert!(!info.reconnect);
     }
 
     #[test]
-    fn test_parse_close_frame_reconnectable_code() {
-        let frame = CloseFrame {
-            code: CloseCode::from(3001),
-            reason: "restart".into(),
-        };
-        let info = parse_close_frame(Some(frame));
+    fn test_parse_close_reconnectable_code() {
+        let info = parse_close(3001, "restart");
         assert!(info.reconnect);
     }
 
     #[test]
-    fn test_parse_close_frame_message_too_big() {
-        let frame = CloseFrame {
-            code: CloseCode::Size,
-            reason: "".into(),
-        };
-        let info = parse_close_frame(Some(frame));
+    fn test_parse_close_message_too_big() {
+        let info = parse_close(1009, "");
         assert_eq!(info.code, codes::disconnect::MESSAGE_SIZE_LIMIT);
         assert!(!info.reconnect);
     }
 
     #[test]
-    fn test_parse_close_frame_none() {
-        let info = parse_close_frame(None);
+    fn test_parse_close_default() {
+        let info = parse_close(1006, "");
         assert_eq!(info.code, codes::connecting::TRANSPORT_CLOSED);
         assert!(info.reconnect);
     }

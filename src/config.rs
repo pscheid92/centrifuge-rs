@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use crate::errors::CentrifugeError;
-use crate::events::{ClientEventHandlers, SubscriptionEventHandlers};
 use crate::protocol::types::StreamPosition;
+
+/// A boxed, `Send`-able future — shorthand for callback return types.
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// Protocol encoding format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -14,16 +17,64 @@ pub enum ProtocolType {
     Protobuf,
 }
 
+// ---------------------------------------------------------------------------
+// Callback types and helpers
+// ---------------------------------------------------------------------------
+
 /// Async callback for obtaining/refreshing a connection token.
-pub type GetTokenFn =
-    Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, CentrifugeError>> + Send>> + Send + Sync>;
+pub type GetTokenFn = Box<dyn Fn() -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
 
 /// Async callback for obtaining/refreshing a subscription token.
-pub type GetSubscriptionTokenFn = Box<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, CentrifugeError>> + Send>>
-        + Send
-        + Sync,
->;
+pub type GetSubscriptionTokenFn = Box<dyn Fn(String) -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
+
+/// Async callback for obtaining fresh connection data on each connect attempt.
+pub type GetDataFn = Box<dyn Fn() -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
+
+/// Async callback for obtaining fresh subscription data on each subscribe attempt.
+pub type GetSubDataFn = Box<dyn Fn(String) -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
+
+/// Helper to create a [`GetTokenFn`] without double-boxing boilerplate.
+///
+/// ```ignore
+/// let config = ClientConfig::new(url)
+///     .get_token(get_token_fn(|| async {
+///         Ok(fetch_token().await?)
+///     }));
+/// ```
+pub fn get_token_fn<F, Fut>(f: F) -> GetTokenFn
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, CentrifugeError>> + Send + 'static,
+{
+    Box::new(move || Box::pin(f()))
+}
+
+/// Helper to create a [`GetSubscriptionTokenFn`] without double-boxing boilerplate.
+pub fn get_sub_token_fn<F, Fut>(f: F) -> GetSubscriptionTokenFn
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<String, CentrifugeError>> + Send + 'static,
+{
+    Box::new(move |channel| Box::pin(f(channel)))
+}
+
+/// Helper to create a [`GetDataFn`] without double-boxing boilerplate.
+pub fn get_data_fn<F, Fut>(f: F) -> GetDataFn
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Vec<u8>, CentrifugeError>> + Send + 'static,
+{
+    Box::new(move || Box::pin(f()))
+}
+
+/// Helper to create a [`GetSubDataFn`] without double-boxing boilerplate.
+pub fn get_sub_data_fn<F, Fut>(f: F) -> GetSubDataFn
+where
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Vec<u8>, CentrifugeError>> + Send + 'static,
+{
+    Box::new(move |channel| Box::pin(f(channel)))
+}
 
 /// Configuration for creating a Client.
 pub struct ClientConfig {
@@ -32,13 +83,14 @@ pub struct ClientConfig {
     pub token: String,
     pub get_token: Option<GetTokenFn>,
     pub data: Vec<u8>,
+    pub get_data: Option<GetDataFn>,
     pub name: String,
     pub version: String,
     pub min_reconnect_delay: Duration,
     pub max_reconnect_delay: Duration,
     pub timeout: Duration,
     pub max_server_ping_delay: Duration,
-    pub events: ClientEventHandlers,
+    pub headers: HashMap<String, String>,
 }
 
 impl Default for ClientConfig {
@@ -49,13 +101,14 @@ impl Default for ClientConfig {
             token: String::new(),
             get_token: None,
             data: Vec::new(),
+            get_data: None,
             name: "rs".into(),
             version: String::new(),
             min_reconnect_delay: Duration::from_millis(500),
             max_reconnect_delay: Duration::from_secs(20),
             timeout: Duration::from_secs(5),
             max_server_ping_delay: Duration::from_secs(10),
-            events: ClientEventHandlers::default(),
+            headers: HashMap::new(),
         }
     }
 }
@@ -88,13 +141,24 @@ impl ClientConfig {
         self
     }
 
-    pub fn name(mut self, name: impl Into<String>) -> Self {
-        self.name = name.into();
+    pub fn get_data(mut self, f: GetDataFn) -> Self {
+        self.get_data = Some(f);
         self
     }
 
+    /// Set client name for analytics (max 16 characters, truncated if longer).
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        let mut name = name.into();
+        name.truncate(16);
+        self.name = name;
+        self
+    }
+
+    /// Set client version for analytics (max 64 characters, truncated if longer).
     pub fn version(mut self, version: impl Into<String>) -> Self {
-        self.version = version.into();
+        let mut version = version.into();
+        version.truncate(64);
+        self.version = version;
         self
     }
 
@@ -118,10 +182,19 @@ impl ClientConfig {
         self
     }
 
-    pub fn events(mut self, events: ClientEventHandlers) -> Self {
-        self.events = events;
+    /// Add a custom header to the WebSocket upgrade request.
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(key.into(), value.into());
         self
     }
+}
+
+/// Delta compression type for subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaType {
+    #[default]
+    None,
+    Fossil,
 }
 
 /// Configuration for creating a Subscription.
@@ -129,13 +202,57 @@ pub struct SubscriptionConfig {
     pub token: String,
     pub get_token: Option<GetSubscriptionTokenFn>,
     pub data: Vec<u8>,
+    pub get_data: Option<GetSubDataFn>,
     pub positioned: bool,
     pub recoverable: bool,
     pub join_leave: bool,
+    pub delta: DeltaType,
+    pub tags_filter: Option<crate::protocol::proto::FilterNode>,
     pub min_resubscribe_delay: Duration,
     pub max_resubscribe_delay: Duration,
     pub since: Option<StreamPosition>,
-    pub events: SubscriptionEventHandlers,
+}
+
+impl SubscriptionConfig {
+    pub fn recoverable(mut self) -> Self {
+        self.recoverable = true;
+        self
+    }
+
+    pub fn delta(mut self, delta: DeltaType) -> Self {
+        self.delta = delta;
+        self
+    }
+
+    pub fn join_leave(mut self) -> Self {
+        self.join_leave = true;
+        self
+    }
+
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.token = token.into();
+        self
+    }
+
+    pub fn get_token(mut self, f: GetSubscriptionTokenFn) -> Self {
+        self.get_token = Some(f);
+        self
+    }
+
+    pub fn since(mut self, pos: StreamPosition) -> Self {
+        self.since = Some(pos);
+        self
+    }
+
+    pub fn data(mut self, data: Vec<u8>) -> Self {
+        self.data = data;
+        self
+    }
+
+    pub fn get_data(mut self, f: GetSubDataFn) -> Self {
+        self.get_data = Some(f);
+        self
+    }
 }
 
 impl Default for SubscriptionConfig {
@@ -144,13 +261,15 @@ impl Default for SubscriptionConfig {
             token: String::new(),
             get_token: None,
             data: Vec::new(),
+            get_data: None,
             positioned: false,
             recoverable: false,
             join_leave: false,
+            delta: DeltaType::None,
+            tags_filter: None,
             min_resubscribe_delay: Duration::from_millis(500),
             max_resubscribe_delay: Duration::from_secs(20),
             since: None,
-            events: SubscriptionEventHandlers::default(),
         }
     }
 }
@@ -210,5 +329,71 @@ mod tests {
     #[test]
     fn test_protocol_type_default() {
         assert_eq!(ProtocolType::default(), ProtocolType::Json);
+    }
+
+    #[test]
+    fn test_client_config_get_token() {
+        let config = ClientConfig::new("ws://test").get_token(get_token_fn(|| async { Ok("token".into()) }));
+        assert!(config.get_token.is_some());
+    }
+
+    #[test]
+    fn test_client_config_get_data() {
+        let config = ClientConfig::new("ws://test").get_data(get_data_fn(|| async { Ok(b"data".to_vec()) }));
+        assert!(config.get_data.is_some());
+    }
+
+    #[test]
+    fn test_client_name_truncation() {
+        let config = ClientConfig::new("ws://test").name("this-name-is-way-too-long-for-the-limit");
+        assert_eq!(config.name.len(), 16);
+        assert_eq!(config.name, "this-name-is-way");
+    }
+
+    #[test]
+    fn test_client_version_truncation() {
+        let long_version = "v".repeat(100);
+        let config = ClientConfig::new("ws://test").version(long_version);
+        assert_eq!(config.version.len(), 64);
+    }
+
+    #[test]
+    fn test_subscription_config_builders() {
+        let config = SubscriptionConfig::default()
+            .recoverable()
+            .delta(DeltaType::Fossil)
+            .join_leave()
+            .token("sub-token")
+            .data(b"sub-data".to_vec())
+            .since(StreamPosition {
+                offset: 10,
+                epoch: "e1".into(),
+            });
+
+        assert!(config.recoverable);
+        assert_eq!(config.delta, DeltaType::Fossil);
+        assert!(config.join_leave);
+        assert_eq!(config.token, "sub-token");
+        assert_eq!(config.data, b"sub-data");
+        let since = config.since.unwrap();
+        assert_eq!(since.offset, 10);
+        assert_eq!(since.epoch, "e1");
+    }
+
+    #[test]
+    fn test_subscription_config_get_token() {
+        let config = SubscriptionConfig::default().get_token(get_sub_token_fn(|_ch| async { Ok("t".into()) }));
+        assert!(config.get_token.is_some());
+    }
+
+    #[test]
+    fn test_subscription_config_get_data() {
+        let config = SubscriptionConfig::default().get_data(get_sub_data_fn(|_ch| async { Ok(b"d".to_vec()) }));
+        assert!(config.get_data.is_some());
+    }
+
+    #[test]
+    fn test_delta_type_default() {
+        assert_eq!(DeltaType::default(), DeltaType::None);
     }
 }

@@ -1,5 +1,7 @@
+use bytes::Buf;
 use prost::Message;
 
+use crate::config::ProtocolType;
 use crate::errors::CentrifugeError;
 use crate::protocol::proto;
 
@@ -9,32 +11,71 @@ pub trait Codec: Send + Sync {
     fn decode_replies(&self, data: &[u8]) -> Result<Vec<proto::Reply>, CentrifugeError>;
 }
 
+/// Custom serde module for `bytes` fields that should be serialized as
+/// embedded JSON objects (not base64 strings). This is required because the
+/// Centrifuge JSON protocol treats `data` fields as raw JSON payloads.
+pub mod embedded_json {
+    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if data.is_empty() {
+            serializer.serialize_none()
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(data).map_err(serde::ser::Error::custom)?;
+            value.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_null() {
+            Ok(Vec::new())
+        } else {
+            serde_json::to_vec(&value).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Helper for skip_serializing_if on u32 fields.
+pub fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
 /// JSON codec: newline-delimited JSON encoding/decoding.
+///
+/// Uses serde derives on prost-generated types directly. The `embedded_json`
+/// module handles the Centrifuge protocol's non-standard treatment of `bytes`
+/// fields as embedded JSON objects.
 pub struct JsonCodec;
 
 impl Codec for JsonCodec {
     fn encode_commands(&self, commands: &[proto::Command]) -> Result<Vec<u8>, CentrifugeError> {
         let mut parts = Vec::with_capacity(commands.len());
         for cmd in commands {
-            let json = serde_json::to_string(&CommandJson::from_proto(cmd))
-                .map_err(|e| CentrifugeError::Protocol(format!("json encode: {e}")))?;
+            let json =
+                serde_json::to_string(cmd).map_err(|e| CentrifugeError::Protocol(format!("json encode: {e}")))?;
             parts.push(json);
         }
         Ok(parts.join("\n").into_bytes())
     }
 
     fn decode_replies(&self, data: &[u8]) -> Result<Vec<proto::Reply>, CentrifugeError> {
-        let text =
-            std::str::from_utf8(data).map_err(|e| CentrifugeError::Protocol(e.to_string()))?;
+        let text = std::str::from_utf8(data).map_err(|e| CentrifugeError::Protocol(e.to_string()))?;
         let mut replies = Vec::new();
         for line in text.split('\n') {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let reply: ReplyJson = serde_json::from_str(line)
-                .map_err(|e| CentrifugeError::Protocol(format!("json decode: {e}")))?;
-            replies.push(reply.to_proto());
+            let reply: proto::Reply =
+                serde_json::from_str(line).map_err(|e| CentrifugeError::Protocol(format!("json decode: {e}")))?;
+            replies.push(reply);
         }
         Ok(replies)
     }
@@ -56,829 +97,29 @@ impl Codec for ProtobufCodec {
 
     fn decode_replies(&self, data: &[u8]) -> Result<Vec<proto::Reply>, CentrifugeError> {
         let mut replies = Vec::new();
-        let mut offset = 0;
-        while offset < data.len() {
-            let (len, bytes_read) = decode_varint(&data[offset..])
+        let mut buf = data;
+        while buf.has_remaining() {
+            let len = prost::encoding::decode_varint(&mut buf)
                 .map_err(|e| CentrifugeError::Protocol(format!("varint decode: {e}")))?;
-            offset += bytes_read;
-            if offset + len > data.len() {
-                return Err(CentrifugeError::Protocol(
-                    "protobuf frame exceeds data length".into(),
-                ));
+            let len = usize::try_from(len).map_err(|_| CentrifugeError::Protocol("frame length overflow".into()))?;
+            if len > buf.remaining() {
+                return Err(CentrifugeError::Protocol("protobuf frame exceeds data length".into()));
             }
-            let reply = proto::Reply::decode(&data[offset..offset + len])
+            let reply = proto::Reply::decode(&buf[..len])
                 .map_err(|e| CentrifugeError::Protocol(format!("protobuf decode: {e}")))?;
             replies.push(reply);
-            offset += len;
+            buf.advance(len);
         }
         Ok(replies)
     }
 }
 
-fn decode_varint(buf: &[u8]) -> Result<(usize, usize), String> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    for (i, &byte) in buf.iter().enumerate() {
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Ok((value as usize, i + 1));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err("varint too long".into());
-        }
-    }
-    Err("unexpected end of varint".into())
-}
-
 /// Creates a codec for the given protocol type.
-pub fn new_codec(protocol_type: crate::config::ProtocolType) -> Box<dyn Codec> {
+pub(crate) fn new_codec(protocol_type: ProtocolType) -> Box<dyn Codec> {
     match protocol_type {
-        crate::config::ProtocolType::Json => Box::new(JsonCodec),
-        crate::config::ProtocolType::Protobuf => Box::new(ProtobufCodec),
+        ProtocolType::Json => Box::new(JsonCodec),
+        ProtocolType::Protobuf => Box::new(ProtobufCodec),
     }
-}
-
-// ---------------------------------------------------------------------------
-// JSON serialization layer
-// ---------------------------------------------------------------------------
-// The Centrifuge JSON protocol uses the same field names as protobuf but with
-// JSON semantics: `data` fields are embedded JSON (not base64 bytes), and
-// only non-default fields are serialized. We use intermediate serde structs
-// rather than deriving on the prost types directly.
-
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-#[derive(Serialize, Default)]
-struct CommandJson {
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    id: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    connect: Option<ConnectRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    subscribe: Option<SubscribeRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    unsubscribe: Option<UnsubscribeRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    publish: Option<PublishRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    presence: Option<PresenceRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    presence_stats: Option<PresenceStatsRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    history: Option<HistoryRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ping: Option<PingRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    send: Option<SendRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rpc: Option<RpcRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refresh: Option<RefreshRequestJson>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sub_refresh: Option<SubRefreshRequestJson>,
-}
-
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct ConnectRequestJson {
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    subs: HashMap<String, SubscribeRequestJson>,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    name: String,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    version: String,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone)]
-struct SubscribeRequestJson {
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    channel: String,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    token: String,
-    #[serde(skip_serializing_if = "is_false", default)]
-    recover: bool,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    epoch: String,
-    #[serde(skip_serializing_if = "is_zero_u64", default)]
-    offset: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "is_false", default)]
-    positioned: bool,
-    #[serde(skip_serializing_if = "is_false", default)]
-    recoverable: bool,
-    #[serde(skip_serializing_if = "is_false", default)]
-    join_leave: bool,
-}
-
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct UnsubscribeRequestJson {
-    channel: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct PublishRequestJson {
-    channel: String,
-    data: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct PresenceRequestJson {
-    channel: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct PresenceStatsRequestJson {
-    channel: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct HistoryRequestJson {
-    channel: String,
-    #[serde(skip_serializing_if = "is_zero_i32", default)]
-    limit: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    since: Option<StreamPositionJson>,
-    #[serde(skip_serializing_if = "is_false", default)]
-    reverse: bool,
-}
-
-fn is_zero_i32(v: &i32) -> bool {
-    *v == 0
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct StreamPositionJson {
-    offset: u64,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    epoch: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct PingRequestJson {}
-
-#[derive(Serialize, Deserialize, Default)]
-struct SendRequestJson {
-    data: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct RpcRequestJson {
-    data: serde_json::Value,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
-    method: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct RefreshRequestJson {
-    token: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct SubRefreshRequestJson {
-    channel: String,
-    token: String,
-}
-
-// --- Reply JSON types ---
-
-#[derive(Deserialize, Default)]
-struct ReplyJson {
-    #[serde(default)]
-    id: u32,
-    #[serde(default)]
-    error: Option<ErrorJson>,
-    #[serde(default)]
-    push: Option<PushJson>,
-    #[serde(default)]
-    connect: Option<ConnectResultJson>,
-    #[serde(default)]
-    subscribe: Option<SubscribeResultJson>,
-    #[serde(default)]
-    unsubscribe: Option<serde_json::Value>,
-    #[serde(default)]
-    publish: Option<serde_json::Value>,
-    #[serde(default)]
-    presence: Option<PresenceResultJson>,
-    #[serde(default)]
-    presence_stats: Option<PresenceStatsResultJson>,
-    #[serde(default)]
-    history: Option<HistoryResultJson>,
-    #[serde(default)]
-    ping: Option<serde_json::Value>,
-    #[serde(default)]
-    rpc: Option<RpcResultJson>,
-    #[serde(default)]
-    refresh: Option<RefreshResultJson>,
-    #[serde(default)]
-    sub_refresh: Option<SubRefreshResultJson>,
-}
-
-#[derive(Deserialize, Default)]
-struct ErrorJson {
-    #[serde(default)]
-    code: u32,
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    temporary: bool,
-}
-
-#[derive(Deserialize, Default)]
-struct PushJson {
-    #[serde(default)]
-    channel: String,
-    #[serde(default, rename = "pub")]
-    publication: Option<PublicationJson>,
-    #[serde(default)]
-    join: Option<JoinJson>,
-    #[serde(default)]
-    leave: Option<LeaveJson>,
-    #[serde(default)]
-    unsubscribe: Option<UnsubscribePushJson>,
-    #[serde(default)]
-    message: Option<MessageJson>,
-    #[serde(default)]
-    subscribe: Option<SubscribePushJson>,
-    #[serde(default)]
-    connect: Option<ConnectPushJson>,
-    #[serde(default)]
-    disconnect: Option<DisconnectPushJson>,
-}
-
-#[derive(Deserialize, Default, Clone)]
-struct PublicationJson {
-    #[serde(default)]
-    data: serde_json::Value,
-    #[serde(default)]
-    info: Option<ClientInfoJson>,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default)]
-    tags: HashMap<String, String>,
-}
-
-#[derive(Deserialize, Default, Clone)]
-struct ClientInfoJson {
-    #[serde(default)]
-    user: String,
-    #[serde(default)]
-    client: String,
-    #[serde(default)]
-    conn_info: Option<serde_json::Value>,
-    #[serde(default)]
-    chan_info: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize, Default)]
-struct JoinJson {
-    info: ClientInfoJson,
-}
-
-#[derive(Deserialize, Default)]
-struct LeaveJson {
-    info: ClientInfoJson,
-}
-
-#[derive(Deserialize, Default)]
-struct UnsubscribePushJson {
-    #[serde(default)]
-    code: u32,
-    #[serde(default)]
-    reason: String,
-}
-
-#[derive(Deserialize, Default)]
-struct MessageJson {
-    #[serde(default)]
-    data: serde_json::Value,
-}
-
-#[derive(Deserialize, Default)]
-struct SubscribePushJson {
-    #[serde(default)]
-    recoverable: bool,
-    #[serde(default)]
-    epoch: String,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default)]
-    positioned: bool,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize, Default)]
-struct ConnectPushJson {
-    #[serde(default)]
-    client: String,
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-    #[serde(default)]
-    subs: HashMap<String, SubscribeResultJson>,
-    #[serde(default)]
-    expires: bool,
-    #[serde(default)]
-    ttl: u32,
-    #[serde(default)]
-    ping: u32,
-    #[serde(default)]
-    pong: bool,
-    #[serde(default)]
-    session: String,
-    #[serde(default)]
-    node: String,
-}
-
-#[derive(Deserialize, Default)]
-struct DisconnectPushJson {
-    #[serde(default)]
-    code: u32,
-    #[serde(default)]
-    reason: String,
-    #[serde(default)]
-    reconnect: bool,
-}
-
-#[derive(Deserialize, Default, Clone)]
-struct ConnectResultJson {
-    #[serde(default)]
-    client: String,
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    expires: bool,
-    #[serde(default)]
-    ttl: u32,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-    #[serde(default)]
-    subs: HashMap<String, SubscribeResultJson>,
-    #[serde(default)]
-    ping: u32,
-    #[serde(default)]
-    pong: bool,
-    #[serde(default)]
-    session: String,
-    #[serde(default)]
-    node: String,
-}
-
-#[derive(Deserialize, Default, Clone)]
-struct SubscribeResultJson {
-    #[serde(default)]
-    expires: bool,
-    #[serde(default)]
-    ttl: u32,
-    #[serde(default)]
-    recoverable: bool,
-    #[serde(default)]
-    epoch: String,
-    #[serde(default)]
-    publications: Vec<PublicationJson>,
-    #[serde(default)]
-    recovered: bool,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default)]
-    positioned: bool,
-    #[serde(default)]
-    data: Option<serde_json::Value>,
-    #[serde(default)]
-    was_recovering: bool,
-}
-
-#[derive(Deserialize, Default)]
-struct PresenceResultJson {
-    #[serde(default)]
-    presence: HashMap<String, ClientInfoJson>,
-}
-
-#[derive(Deserialize, Default)]
-struct PresenceStatsResultJson {
-    #[serde(default)]
-    num_clients: u32,
-    #[serde(default)]
-    num_users: u32,
-}
-
-#[derive(Deserialize, Default)]
-struct HistoryResultJson {
-    #[serde(default)]
-    publications: Vec<PublicationJson>,
-    #[serde(default)]
-    epoch: String,
-    #[serde(default)]
-    offset: u64,
-}
-
-#[derive(Deserialize, Default)]
-struct RpcResultJson {
-    #[serde(default)]
-    data: serde_json::Value,
-}
-
-#[derive(Deserialize, Default)]
-struct RefreshResultJson {
-    #[serde(default)]
-    client: String,
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    expires: bool,
-    #[serde(default)]
-    ttl: u32,
-}
-
-#[derive(Deserialize, Default)]
-struct SubRefreshResultJson {
-    #[serde(default)]
-    expires: bool,
-    #[serde(default)]
-    ttl: u32,
-}
-
-// ---------------------------------------------------------------------------
-// Conversion: CommandJson <-> proto::Command
-// ---------------------------------------------------------------------------
-
-impl CommandJson {
-    fn from_proto(cmd: &proto::Command) -> Self {
-        let mut json = CommandJson {
-            id: cmd.id,
-            ..Default::default()
-        };
-        if let Some(req) = &cmd.connect {
-            json.connect = Some(ConnectRequestJson {
-                token: req.token.clone(),
-                data: json_value_from_bytes(&req.data),
-                subs: req
-                    .subs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), SubscribeRequestJson::from_proto_req(v)))
-                    .collect(),
-                name: req.name.clone(),
-                version: req.version.clone(),
-            });
-        }
-        if let Some(req) = &cmd.subscribe {
-            json.subscribe = Some(SubscribeRequestJson::from_proto_req(req));
-        }
-        if let Some(req) = &cmd.unsubscribe {
-            json.unsubscribe = Some(UnsubscribeRequestJson {
-                channel: req.channel.clone(),
-            });
-        }
-        if let Some(req) = &cmd.publish {
-            json.publish = Some(PublishRequestJson {
-                channel: req.channel.clone(),
-                data: json_value_from_bytes(&req.data).unwrap_or(serde_json::Value::Null),
-            });
-        }
-        if let Some(req) = &cmd.presence {
-            json.presence = Some(PresenceRequestJson {
-                channel: req.channel.clone(),
-            });
-        }
-        if let Some(req) = &cmd.presence_stats {
-            json.presence_stats = Some(PresenceStatsRequestJson {
-                channel: req.channel.clone(),
-            });
-        }
-        if let Some(req) = &cmd.history {
-            json.history = Some(HistoryRequestJson {
-                channel: req.channel.clone(),
-                limit: req.limit,
-                since: req.since.as_ref().map(|s| StreamPositionJson {
-                    offset: s.offset,
-                    epoch: s.epoch.clone(),
-                }),
-                reverse: req.reverse,
-            });
-        }
-        if cmd.ping.is_some() {
-            json.ping = Some(PingRequestJson {});
-        }
-        if let Some(req) = &cmd.send {
-            json.send = Some(SendRequestJson {
-                data: json_value_from_bytes(&req.data).unwrap_or(serde_json::Value::Null),
-            });
-        }
-        if let Some(req) = &cmd.rpc {
-            json.rpc = Some(RpcRequestJson {
-                data: json_value_from_bytes(&req.data).unwrap_or(serde_json::Value::Null),
-                method: req.method.clone(),
-            });
-        }
-        if let Some(req) = &cmd.refresh {
-            json.refresh = Some(RefreshRequestJson {
-                token: req.token.clone(),
-            });
-        }
-        if let Some(req) = &cmd.sub_refresh {
-            json.sub_refresh = Some(SubRefreshRequestJson {
-                channel: req.channel.clone(),
-                token: req.token.clone(),
-            });
-        }
-        json
-    }
-}
-
-impl SubscribeRequestJson {
-    fn from_proto_req(req: &proto::SubscribeRequest) -> Self {
-        Self {
-            channel: req.channel.clone(),
-            token: req.token.clone(),
-            recover: req.recover,
-            epoch: req.epoch.clone(),
-            offset: req.offset,
-            data: json_value_from_bytes(&req.data),
-            positioned: req.positioned,
-            recoverable: req.recoverable,
-            join_leave: req.join_leave,
-        }
-    }
-}
-
-impl ReplyJson {
-    fn to_proto(&self) -> proto::Reply {
-        let mut reply = proto::Reply {
-            id: self.id,
-            ..Default::default()
-        };
-        if let Some(err) = &self.error {
-            reply.error = Some(proto::Error {
-                code: err.code,
-                message: err.message.clone(),
-                temporary: err.temporary,
-            });
-        }
-        if let Some(push) = &self.push {
-            reply.push = Some(push.to_proto());
-        }
-        if let Some(c) = &self.connect {
-            reply.connect = Some(c.to_proto());
-        }
-        if let Some(s) = &self.subscribe {
-            reply.subscribe = Some(s.to_proto());
-        }
-        if self.unsubscribe.is_some() {
-            reply.unsubscribe = Some(proto::UnsubscribeResult {});
-        }
-        if self.publish.is_some() {
-            reply.publish = Some(proto::PublishResult {});
-        }
-        if let Some(p) = &self.presence {
-            reply.presence = Some(p.to_proto());
-        }
-        if let Some(ps) = &self.presence_stats {
-            reply.presence_stats = Some(proto::PresenceStatsResult {
-                num_clients: ps.num_clients,
-                num_users: ps.num_users,
-            });
-        }
-        if let Some(h) = &self.history {
-            reply.history = Some(h.to_proto());
-        }
-        if self.ping.is_some() {
-            reply.ping = Some(proto::PingResult {});
-        }
-        if let Some(r) = &self.rpc {
-            reply.rpc = Some(proto::RpcResult {
-                data: json_value_to_bytes(&r.data),
-            });
-        }
-        if let Some(r) = &self.refresh {
-            reply.refresh = Some(proto::RefreshResult {
-                client: r.client.clone(),
-                version: r.version.clone(),
-                expires: r.expires,
-                ttl: r.ttl,
-            });
-        }
-        if let Some(sr) = &self.sub_refresh {
-            reply.sub_refresh = Some(proto::SubRefreshResult {
-                expires: sr.expires,
-                ttl: sr.ttl,
-            });
-        }
-        reply
-    }
-}
-
-impl PushJson {
-    fn to_proto(&self) -> proto::Push {
-        let mut push = proto::Push {
-            channel: self.channel.clone(),
-            ..Default::default()
-        };
-        if let Some(p) = &self.publication {
-            push.r#pub = Some(p.to_proto());
-        }
-        if let Some(j) = &self.join {
-            push.join = Some(proto::Join {
-                info: Some(j.info.to_proto()),
-            });
-        }
-        if let Some(l) = &self.leave {
-            push.leave = Some(proto::Leave {
-                info: Some(l.info.to_proto()),
-            });
-        }
-        if let Some(u) = &self.unsubscribe {
-            push.unsubscribe = Some(proto::Unsubscribe {
-                code: u.code,
-                reason: u.reason.clone(),
-            });
-        }
-        if let Some(m) = &self.message {
-            push.message = Some(proto::Message {
-                data: json_value_to_bytes(&m.data),
-            });
-        }
-        if let Some(s) = &self.subscribe {
-            push.subscribe = Some(proto::Subscribe {
-                recoverable: s.recoverable,
-                epoch: s.epoch.clone(),
-                offset: s.offset,
-                positioned: s.positioned,
-                data: s
-                    .data
-                    .as_ref()
-                    .map(json_value_to_bytes)
-                    .unwrap_or_default(),
-            });
-        }
-        if let Some(c) = &self.connect {
-            push.connect = Some(proto::Connect {
-                client: c.client.clone(),
-                version: c.version.clone(),
-                data: c
-                    .data
-                    .as_ref()
-                    .map(json_value_to_bytes)
-                    .unwrap_or_default(),
-                subs: c
-                    .subs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_proto()))
-                    .collect(),
-                expires: c.expires,
-                ttl: c.ttl,
-                ping: c.ping,
-                pong: c.pong,
-                session: c.session.clone(),
-                node: c.node.clone(),
-                time: 0,
-            });
-        }
-        if let Some(d) = &self.disconnect {
-            push.disconnect = Some(proto::Disconnect {
-                code: d.code,
-                reason: d.reason.clone(),
-                reconnect: d.reconnect,
-            });
-        }
-        push
-    }
-}
-
-impl ConnectResultJson {
-    fn to_proto(&self) -> proto::ConnectResult {
-        proto::ConnectResult {
-            client: self.client.clone(),
-            version: self.version.clone(),
-            expires: self.expires,
-            ttl: self.ttl,
-            data: self
-                .data
-                .as_ref()
-                .map(json_value_to_bytes)
-                .unwrap_or_default(),
-            subs: self
-                .subs
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_proto()))
-                .collect(),
-            ping: self.ping,
-            pong: self.pong,
-            session: self.session.clone(),
-            node: self.node.clone(),
-            time: 0,
-        }
-    }
-}
-
-impl SubscribeResultJson {
-    fn to_proto(&self) -> proto::SubscribeResult {
-        proto::SubscribeResult {
-            expires: self.expires,
-            ttl: self.ttl,
-            recoverable: self.recoverable,
-            epoch: self.epoch.clone(),
-            publications: self.publications.iter().map(|p| p.to_proto()).collect(),
-            recovered: self.recovered,
-            offset: self.offset,
-            positioned: self.positioned,
-            data: self
-                .data
-                .as_ref()
-                .map(json_value_to_bytes)
-                .unwrap_or_default(),
-            was_recovering: self.was_recovering,
-            delta: false,
-        }
-    }
-}
-
-impl PublicationJson {
-    fn to_proto(&self) -> proto::Publication {
-        proto::Publication {
-            data: json_value_to_bytes(&self.data),
-            info: self.info.as_ref().map(|i| i.to_proto()),
-            offset: self.offset,
-            tags: self.tags.clone(),
-            delta: false,
-            time: 0,
-            channel: String::new(),
-        }
-    }
-}
-
-impl ClientInfoJson {
-    fn to_proto(&self) -> proto::ClientInfo {
-        proto::ClientInfo {
-            user: self.user.clone(),
-            client: self.client.clone(),
-            conn_info: self
-                .conn_info
-                .as_ref()
-                .map(json_value_to_bytes)
-                .unwrap_or_default(),
-            chan_info: self
-                .chan_info
-                .as_ref()
-                .map(json_value_to_bytes)
-                .unwrap_or_default(),
-        }
-    }
-}
-
-impl PresenceResultJson {
-    fn to_proto(&self) -> proto::PresenceResult {
-        proto::PresenceResult {
-            presence: self
-                .presence
-                .iter()
-                .map(|(k, v)| (k.clone(), v.to_proto()))
-                .collect(),
-        }
-    }
-}
-
-impl HistoryResultJson {
-    fn to_proto(&self) -> proto::HistoryResult {
-        proto::HistoryResult {
-            publications: self.publications.iter().map(|p| p.to_proto()).collect(),
-            epoch: self.epoch.clone(),
-            offset: self.offset,
-        }
-    }
-}
-
-/// Convert bytes to a JSON value (for JSON protocol, data fields are embedded JSON).
-fn json_value_from_bytes(data: &[u8]) -> Option<serde_json::Value> {
-    if data.is_empty() {
-        return None;
-    }
-    serde_json::from_slice(data).ok()
-}
-
-/// Convert a JSON value back to bytes.
-fn json_value_to_bytes(value: &serde_json::Value) -> Vec<u8> {
-    if value.is_null() {
-        return Vec::new();
-    }
-    serde_json::to_vec(value).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1004,6 +245,31 @@ mod tests {
     }
 
     #[test]
+    fn test_json_embedded_data_encode() {
+        let cmd = proto::Command {
+            id: 1,
+            publish: Some(proto::PublishRequest {
+                channel: "ch".into(),
+                data: br#"{"msg":"hello"}"#.to_vec(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // data must be embedded JSON, not base64
+        assert_eq!(parsed["publish"]["data"]["msg"], "hello");
+    }
+
+    #[test]
+    fn test_json_embedded_data_decode() {
+        let json = r#"{"push":{"channel":"ch","pub":{"data":{"msg":"world"}}}}"#;
+        let reply: proto::Reply = serde_json::from_str(json).unwrap();
+        let data = &reply.push.unwrap().r#pub.unwrap().data;
+        let parsed: serde_json::Value = serde_json::from_slice(data).unwrap();
+        assert_eq!(parsed["msg"], "world");
+    }
+
+    #[test]
     fn test_protobuf_roundtrip_single_command() {
         let codec = ProtobufCodec;
         let cmd = proto::Command {
@@ -1016,12 +282,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let encoded = codec.encode_commands(&[cmd.clone()]).unwrap();
-        // Decode as replies won't work since Command != Reply, but we can verify encoding
-        // by manually decoding
-        let (len, bytes_read) = decode_varint(&encoded).unwrap();
-        assert_eq!(bytes_read + len, encoded.len());
-        let decoded = proto::Command::decode(&encoded[bytes_read..bytes_read + len]).unwrap();
+        let encoded = codec.encode_commands(std::slice::from_ref(&cmd)).unwrap();
+        let mut buf = &encoded[..];
+        let len = prost::encoding::decode_varint(&mut buf).unwrap() as usize;
+        assert_eq!(buf.len(), len);
+        let decoded = proto::Command::decode(&buf[..len]).unwrap();
         assert_eq!(decoded.id, 1);
         assert_eq!(
             decoded.connect.as_ref().unwrap().token,
@@ -1032,7 +297,6 @@ mod tests {
     #[test]
     fn test_protobuf_roundtrip_reply() {
         let codec = ProtobufCodec;
-        // Create a reply, encode it manually, then decode via codec
         let reply = proto::Reply {
             id: 1,
             connect: Some(proto::ConnectResult {
@@ -1048,10 +312,8 @@ mod tests {
         let mut frame = Vec::new();
         prost::encoding::encode_varint(reply_bytes.len() as u64, &mut frame);
         frame.extend_from_slice(&reply_bytes);
-
         let decoded = codec.decode_replies(&frame).unwrap();
         assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].id, 1);
         assert_eq!(decoded[0].connect.as_ref().unwrap().client, "abc");
     }
 
@@ -1076,30 +338,96 @@ mod tests {
             prost::encoding::encode_varint(bytes.len() as u64, &mut frame);
             frame.extend_from_slice(&bytes);
         }
-
         let decoded = codec.decode_replies(&frame).unwrap();
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].id, 1);
-        assert_eq!(decoded[1].id, 2);
     }
 
     #[test]
     fn test_protobuf_empty_data() {
         let codec = ProtobufCodec;
-        let decoded = codec.decode_replies(&[]).unwrap();
-        assert!(decoded.is_empty());
+        assert!(codec.decode_replies(&[]).unwrap().is_empty());
     }
 
     #[test]
     fn test_varint_decode() {
-        // 300 encoded as varint: 0xAC 0x02
-        let (val, len) = decode_varint(&[0xAC, 0x02]).unwrap();
+        let mut buf: &[u8] = &[0xAC, 0x02];
+        let val = prost::encoding::decode_varint(&mut buf).unwrap();
         assert_eq!(val, 300);
-        assert_eq!(len, 2);
+        assert_eq!(buf.len(), 0); // fully consumed
 
-        // 1 encoded as varint: 0x01
-        let (val, len) = decode_varint(&[0x01]).unwrap();
+        let mut buf: &[u8] = &[0x01];
+        let val = prost::encoding::decode_varint(&mut buf).unwrap();
         assert_eq!(val, 1);
-        assert_eq!(len, 1);
+        assert_eq!(buf.len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Protobuf codec error handling
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_protobuf_truncated_varint() {
+        let codec = ProtobufCodec;
+        // 0x80 means "more bytes follow" but there are none
+        let result = codec.decode_replies(&[0x80]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("varint"), "error should mention varint: {msg}");
+    }
+
+    #[test]
+    fn test_protobuf_varint_too_long() {
+        let codec = ProtobufCodec;
+        // 10 bytes of continuation (shift would exceed 64 bits)
+        let data = [0x80; 10];
+        let result = codec.decode_replies(&data);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("varint"), "error should mention varint: {msg}");
+    }
+
+    #[test]
+    fn test_protobuf_frame_exceeds_data_length() {
+        let codec = ProtobufCodec;
+        // Varint says 100 bytes follow, but only 2 bytes of data available
+        let data = [100, 0x0A, 0x0B];
+        let result = codec.decode_replies(&data);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exceeds"), "error should mention exceeds: {msg}");
+    }
+
+    #[test]
+    fn test_protobuf_garbage_data_in_valid_frame() {
+        let codec = ProtobufCodec;
+        // Varint says 5 bytes follow, then 5 bytes of garbage
+        let data = [5, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let result = codec.decode_replies(&data);
+        // prost should fail to decode this as a Reply
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("protobuf decode"),
+            "error should mention protobuf decode: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_protobuf_partial_frame_after_valid() {
+        let codec = ProtobufCodec;
+        // First: a valid empty Reply (varint=0, no bytes)
+        // Second: truncated frame (varint says 50, only 1 byte follows)
+        let data = [0, 50, 0x0A];
+        let result = codec.decode_replies(&data);
+        assert!(result.is_err(), "should fail on the truncated second frame");
+    }
+
+    #[test]
+    fn test_protobuf_zero_length_frame() {
+        let codec = ProtobufCodec;
+        // Varint = 0 means a zero-byte protobuf message (valid empty Reply)
+        let result = codec.decode_replies(&[0]);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
     }
 }

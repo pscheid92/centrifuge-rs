@@ -1,43 +1,28 @@
-use std::fmt;
-
 use crate::protocol::types::ServerError;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CentrifugeError {
+    #[error("operation timed out")]
     Timeout,
+    #[error("client disconnected")]
     ClientDisconnected,
+    #[error("client closed")]
     ClientClosed,
+    #[error("subscription unsubscribed")]
     SubscriptionUnsubscribed,
+    #[error("subscription to this channel already exists")]
     DuplicateSubscription,
+    #[error("unauthorized")]
     Unauthorized,
-    Transport(String),
+    #[error("transport error: {0}")]
+    Transport(Box<dyn std::error::Error + Send + Sync>),
+    #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("bad configuration: {0}")]
     BadConfiguration(String),
+    #[error("server error {}: {}", .0.code, .0.message)]
     Server(ServerError),
 }
-
-impl fmt::Display for CentrifugeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CentrifugeError::Timeout => write!(f, "operation timed out"),
-            CentrifugeError::ClientDisconnected => write!(f, "client disconnected"),
-            CentrifugeError::ClientClosed => write!(f, "client closed"),
-            CentrifugeError::SubscriptionUnsubscribed => write!(f, "subscription unsubscribed"),
-            CentrifugeError::DuplicateSubscription => {
-                write!(f, "subscription to this channel already exists")
-            }
-            CentrifugeError::Unauthorized => write!(f, "unauthorized"),
-            CentrifugeError::Transport(msg) => write!(f, "transport error: {msg}"),
-            CentrifugeError::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            CentrifugeError::BadConfiguration(msg) => write!(f, "bad configuration: {msg}"),
-            CentrifugeError::Server(err) => {
-                write!(f, "server error {}: {}", err.code, err.message)
-            }
-        }
-    }
-}
-
-impl std::error::Error for CentrifugeError {}
 
 pub type Result<T> = std::result::Result<T, CentrifugeError>;
 
@@ -46,6 +31,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[rustfmt::skip]
     fn test_display_all_variants() {
         assert_eq!(CentrifugeError::Timeout.to_string(), "operation timed out");
         assert_eq!(CentrifugeError::ClientDisconnected.to_string(), "client disconnected");
@@ -56,10 +42,7 @@ mod tests {
         assert_eq!(CentrifugeError::Transport("conn reset".into()).to_string(), "transport error: conn reset");
         assert_eq!(CentrifugeError::Protocol("bad frame".into()).to_string(), "protocol error: bad frame");
         assert_eq!(CentrifugeError::BadConfiguration("missing url".into()).to_string(), "bad configuration: missing url");
-        assert_eq!(
-            CentrifugeError::Server(ServerError { code: 100, message: "internal".into(), temporary: false }).to_string(),
-            "server error 100: internal"
-        );
+        assert_eq!(CentrifugeError::Server(ServerError { code: 100, message: "internal".into(), temporary: false }).to_string(), "server error 100: internal");
     }
 
     #[test]

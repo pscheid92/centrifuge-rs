@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --features native-tls -- -D warnings
+      - run: cargo test --lib --features native-tls
+      - run: cargo test --test actor_commands --test actor_connection --test actor_server_subs --test actor_state --test actor_subscriptions --test actor_token --features native-tls
+
+  publish:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    name: GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get commits since previous tag (or all if first release)
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          if [ "$PREV_TAG" = "${GITHUB_REF#refs/tags/}" ] || [ -z "$PREV_TAG" ]; then
+            NOTES="Initial release of centrifuge-client."
+          else
+            NOTES=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD)
+          fi
+          # Write to file to handle multiline
+          echo "$NOTES" > /tmp/release-notes.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.version.outputs.version }}
+          body_path: /tmp/release-notes.txt
+          generate_release_notes: true

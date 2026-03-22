@@ -32,7 +32,7 @@ pub mod unsubscribed {
 /// Reconnect ranges: 3000-3499, 4000-4499.
 /// Terminal ranges: 3500-3999, 4500-4999.
 pub fn should_reconnect_on_disconnect(code: u32) -> bool {
-    (3000..3500).contains(&code) || (4000..4500).contains(&code)
+    !(3500..5000).contains(&code) || (4000..4500).contains(&code)
 }
 
 /// Returns true if the server unsubscribe code indicates the client should resubscribe.
@@ -41,18 +41,21 @@ pub fn should_resubscribe_on_unsubscribe(code: u32) -> bool {
     code >= 2500
 }
 
-/// Server error code for token expired.
-pub const TOKEN_EXPIRED: u32 = 109;
+/// Server error codes (codes 100+ returned by the server in error replies).
+pub mod server_error {
+    /// Internal error (marks the boundary between client-side [0-99] and server-side [100+]).
+    pub const INTERNAL_ERROR: u32 = 100;
 
-/// Server error code for internal error.
-pub const INTERNAL_ERROR: u32 = 100;
+    /// Already subscribed — tolerated as success when retrying after timeout.
+    pub const ALREADY_SUBSCRIBED: u32 = 105;
 
-/// Server error code for already subscribed.
-pub const ALREADY_SUBSCRIBED: u32 = 105;
+    /// Token expired — triggers token refresh.
+    pub const TOKEN_EXPIRED: u32 = 109;
 
-/// Returns true if the server error is temporary (should retry).
-pub fn is_temporary_error(code: u32, temporary: bool) -> bool {
-    temporary || code < 100 || code == TOKEN_EXPIRED
+    /// Returns true if the server error is temporary (should retry).
+    pub fn is_temporary(code: u32, temporary: bool) -> bool {
+        temporary || code < INTERNAL_ERROR || code == TOKEN_EXPIRED
+    }
 }
 
 #[cfg(test)]
@@ -67,16 +70,14 @@ mod tests {
         assert!(should_reconnect_on_disconnect(3499));
         assert!(should_reconnect_on_disconnect(4000));
         assert!(should_reconnect_on_disconnect(4499));
+        assert!(should_reconnect_on_disconnect(5000)); // >= 5000 reconnectable
+        assert!(should_reconnect_on_disconnect(9999));
 
         // Terminal ranges
         assert!(!should_reconnect_on_disconnect(3500));
         assert!(!should_reconnect_on_disconnect(3999));
         assert!(!should_reconnect_on_disconnect(4500));
         assert!(!should_reconnect_on_disconnect(4999));
-
-        // Out of range
-        assert!(!should_reconnect_on_disconnect(2999));
-        assert!(!should_reconnect_on_disconnect(5000));
     }
 
     #[test]
@@ -89,10 +90,10 @@ mod tests {
 
     #[test]
     fn test_is_temporary_error() {
-        assert!(is_temporary_error(50, false)); // code < 100
-        assert!(is_temporary_error(109, false)); // token expired
-        assert!(is_temporary_error(500, true)); // explicit temporary flag
-        assert!(!is_temporary_error(100, false)); // internal error, not temporary
-        assert!(!is_temporary_error(200, false)); // permanent error
+        assert!(server_error::is_temporary(50, false)); // code < 100
+        assert!(server_error::is_temporary(109, false)); // token expired
+        assert!(server_error::is_temporary(500, true)); // explicit temporary flag
+        assert!(!server_error::is_temporary(100, false)); // internal error, not temporary
+        assert!(!server_error::is_temporary(200, false)); // permanent error
     }
 }

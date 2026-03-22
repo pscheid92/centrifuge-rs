@@ -1,56 +1,40 @@
-use centrifuge::{
-    Client, ClientConfig, SubscriptionConfig,
-    events::{ClientEventHandlers, SubscriptionEventHandlers},
-};
+use centrifuge_client::{Client, ClientConfig, ClientEvent, SubEvent};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let events = ClientEventHandlers::default()
-        .on_connecting(|ctx| {
-            println!("connecting: {} (code {})", ctx.reason, ctx.code);
-        })
-        .on_connected(|ctx| {
-            println!("connected: client_id={}", ctx.client_id);
-        })
-        .on_disconnected(|ctx| {
-            println!("disconnected: {} (code {})", ctx.reason, ctx.code);
-        });
+    let client = Client::new(ClientConfig::new("ws://localhost:8000/connection/websocket"));
 
-    let config = ClientConfig::new("ws://localhost:8000/connection/websocket")
-        .events(events);
+    let mut client_events = client.events()?;
 
-    let client = Client::new(config);
-
-    let sub_events = SubscriptionEventHandlers::default()
-        .on_subscribing(|ctx| {
-            println!("subscribing: {}", ctx.reason);
-        })
-        .on_subscribed(|ctx| {
-            println!("subscribed to {}", ctx.channel);
-        })
-        .on_publication(|ctx| {
-            println!(
-                "publication on {}: {} bytes",
-                ctx.channel,
-                ctx.publication.data.len()
-            );
-        })
-        .on_unsubscribed(|ctx| {
-            println!("unsubscribed: {} (code {})", ctx.reason, ctx.code);
-        });
-
-    let sub_config = SubscriptionConfig {
-        events: sub_events,
-        ..Default::default()
-    };
-
-    let sub = client.new_subscription("example", sub_config).await?;
-    sub.subscribe().await?;
+    let (sub, mut sub_events) = client.subscribe("example").await?;
 
     client.connect().await?;
 
-    println!("Press Ctrl+C to exit...");
-    tokio::signal::ctrl_c().await?;
+    println!("Connected. Press Ctrl+C to exit...");
+
+    loop {
+        tokio::select! {
+            Some(event) = sub_events.recv() => match event {
+                SubEvent::Publication(pub_data) => {
+                    println!("publication on {}: {} bytes", sub.channel(), pub_data.data.len());
+                }
+                SubEvent::Subscribed(ctx) => {
+                    println!("subscribed to {}", ctx.channel);
+                }
+                SubEvent::Unsubscribed(ctx) => {
+                    println!("unsubscribed: {}", ctx.reason);
+                }
+                _ => {}
+            },
+            Some(event) = client_events.recv() => match event {
+                ClientEvent::Connecting(ctx) => println!("connecting: {}", ctx.reason),
+                ClientEvent::Connected(ctx) => println!("connected: client_id={}", ctx.client_id),
+                ClientEvent::Disconnected(ctx) => println!("disconnected: {}", ctx.reason),
+                _ => {}
+            },
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
 
     client.disconnect().await?;
     Ok(())

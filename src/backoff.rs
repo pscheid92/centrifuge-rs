@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Calculates the next reconnect/resubscribe delay using exponential backoff with full jitter.
 ///
@@ -8,14 +8,12 @@ use rand::Rng;
 ///
 /// This follows the "Full Jitter" strategy recommended by AWS to prevent thundering herd.
 pub fn next_delay(attempt: u32, min_delay: Duration, max_delay: Duration) -> Duration {
-    let base = min_delay
-        .as_millis()
-        .saturating_mul(2u128.saturating_pow(attempt));
+    let base = min_delay.as_millis().saturating_mul(2u128.saturating_pow(attempt));
     let capped = base.min(max_delay.as_millis());
     if capped == 0 {
         return Duration::ZERO;
     }
-    let jittered = rand::thread_rng().gen_range(0..=capped);
+    let jittered = rand::rng().random_range(0..=capped);
     Duration::from_millis(jittered as u64)
 }
 
