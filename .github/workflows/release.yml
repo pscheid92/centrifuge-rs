@@ -16,11 +16,11 @@ jobs:
     name: Verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features native-tls -- -D warnings
@@ -32,9 +32,9 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo publish
         env:
@@ -45,7 +45,7 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Extract version from tag
@@ -64,7 +64,7 @@ jobs:
           # Write to file to handle multiline
           echo "$NOTES" > /tmp/release-notes.txt
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: v${{ steps.version.outputs.version }}
           body_path: /tmp/release-notes.txt

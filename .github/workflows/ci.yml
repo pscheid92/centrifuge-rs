@@ -17,9 +17,9 @@ jobs:
       matrix:
         features: [native-tls, rustls]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo check --all-targets --no-default-features --features ${{ matrix.features }}
 
@@ -27,11 +27,11 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --all-targets --features native-tls -- -D warnings
 
@@ -39,7 +39,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -49,9 +49,9 @@ jobs:
     name: Unit & Actor Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --lib --features native-tls
       - run: cargo test --test actor_commands --test actor_connection --test actor_server_subs --test actor_state --test actor_subscriptions --test actor_token --features native-tls
@@ -60,9 +60,9 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --test integration_test --test integration_advanced_test --features native-tls
 
@@ -70,9 +70,9 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v3
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo doc --no-deps --features native-tls
         env:
