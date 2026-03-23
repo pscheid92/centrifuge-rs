@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features native-tls -- -D warnings
@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo publish
         env:
