@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get install -y protobuf-compiler
-      - run: cargo check --all-targets --features ${{ matrix.features }}
+      - run: cargo check --all-targets --no-default-features --features ${{ matrix.features }}
 
   clippy:
     name: Clippy
