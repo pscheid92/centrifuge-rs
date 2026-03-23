@@ -31,9 +31,6 @@
 //! The main entry points are [`Client`] and [`Subscription`]. See [`ClientConfig`] and
 //! [`SubscriptionConfig`] for configuration options.
 
-#[cfg(all(feature = "native-tls", feature = "rustls"))]
-compile_error!("Features `native-tls` and `rustls` are mutually exclusive. Enable only one.");
-
 #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
 compile_error!("Either the `native-tls` or `rustls` feature must be enabled for TLS support.");
 
