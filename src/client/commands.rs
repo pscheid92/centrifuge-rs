@@ -191,17 +191,20 @@ impl ConnectionActor {
         }));
 
         if was_subscribed && self.state == ClientState::Connected {
-            let id = self.next_cmd_id();
+            // Fire-and-forget wire unsubscribe. We don't track the reply
+            // because no state update or caller notification hangs off it
+            // (unlike refresh/sub_refresh), and scheduling a timeout whose
+            // fire path only send()s to a dropped oneshot is wasted work.
+            // The user's `reply` below acknowledges the unsubscribe locally;
+            // stray server reply ids are handled by the unknown-id path in
+            // dispatch_reply.
             let cmd = proto::Command {
-                id,
+                id: self.next_cmd_id(),
                 unsubscribe: Some(proto::UnsubscribeRequest {
                     channel: channel.clone(),
                 }),
                 ..Default::default()
             };
-            let (unsub_tx, _) = oneshot::channel();
-            self.pending.insert(id, PendingRequest::Request(unsub_tx));
-            self.schedule_request_timeout(id);
             if self.send_command(&cmd).await.is_err() {
                 let _ = reply.send(Ok(()));
                 self.on_transport_close(Some(crate::transport::DisconnectInfo {
