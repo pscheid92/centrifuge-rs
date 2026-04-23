@@ -236,11 +236,11 @@ impl ConnectionActor {
                             self.handle_transport_data(&data).await;
                         }
                         Some(TransportFrame::Close(info)) => {
-                            self.on_transport_close(info).await;
+                            self.on_transport_close(info);
                             return;
                         }
                         None => {
-                            self.on_transport_close(None).await;
+                            self.on_transport_close(None);
                             return;
                         }
                     }
@@ -261,7 +261,7 @@ impl ConnectionActor {
                             code: codes::connecting::NO_PING,
                             reason: "no ping".into(),
                             reconnect: true,
-                        })).await;
+                        }));
                         return;
                     }
                 }
@@ -278,8 +278,7 @@ impl ConnectionActor {
                     code: codes::disconnect::BAD_PROTOCOL,
                     reason: format!("decode error: {e}"),
                     reconnect: false,
-                }))
-                .await;
+                }));
                 return;
             }
         };
@@ -306,19 +305,19 @@ impl ConnectionActor {
 
         if reply.id == 0 {
             if let Some(push) = reply.push {
-                self.handle_push(push).await;
+                self.handle_push(push);
             }
             return;
         }
 
         if let Some(req) = self.pending.remove(&reply.id) {
-            self.resolve_pending(req, reply).await;
+            self.resolve_pending(req, reply);
         } else {
             debug!(id = reply.id, "received reply for unknown request");
         }
     }
 
-    pub(super) async fn resolve_pending(&mut self, req: PendingRequest, reply: proto::Reply) {
+    pub(super) fn resolve_pending(&mut self, req: PendingRequest, reply: proto::Reply) {
         match req {
             PendingRequest::Subscribe { channel, sender } => {
                 if let Some(ref err) = reply.error

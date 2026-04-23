@@ -6,7 +6,7 @@ use crate::protocol::{proto, types::*};
 use crate::transport;
 
 impl ConnectionActor {
-    pub(super) async fn handle_push(&mut self, push: proto::Push) {
+    pub(super) fn handle_push(&mut self, push: proto::Push) {
         let channel = push.channel.clone();
 
         if let Some(pub_msg) = push.r#pub {
@@ -20,7 +20,7 @@ impl ConnectionActor {
         } else if let Some(sub) = push.subscribe {
             self.handle_server_subscribe(&channel, &sub);
         } else if let Some(disconnect) = push.disconnect {
-            self.handle_disconnect_push(disconnect).await;
+            self.handle_disconnect_push(disconnect);
         } else if let Some(message) = push.message {
             self.emit_client_event(ClientEvent::Message(MessageContext { data: message.data }));
         }
@@ -152,7 +152,7 @@ impl ConnectionActor {
         }));
     }
 
-    async fn handle_disconnect_push(&mut self, disconnect: proto::Disconnect) {
+    fn handle_disconnect_push(&mut self, disconnect: proto::Disconnect) {
         // Reconnect decision is defined purely by code ranges per the Centrifuge SDK
         // spec (see additionals/client_sdk.md — "Disconnect codes"). The proto's
         // `reconnect` field is ignored for push disconnects, matching the Go and JS
@@ -163,8 +163,7 @@ impl ConnectionActor {
                 code: disconnect.code,
                 reason: disconnect.reason,
                 reconnect: true,
-            }))
-            .await;
+            }));
         } else {
             self.move_to_disconnected(disconnect.code, &disconnect.reason);
         }

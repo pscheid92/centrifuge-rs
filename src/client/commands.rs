@@ -117,8 +117,7 @@ impl ConnectionActor {
                         code: codes::connecting::SUBSCRIBE_TIMEOUT,
                         reason: "subscribe timeout".into(),
                         reconnect: true,
-                    }))
-                    .await;
+                    }));
                 }
             }
         }
@@ -211,8 +210,7 @@ impl ConnectionActor {
                     code: codes::connecting::UNSUBSCRIBE_ERROR,
                     reason: "unsubscribe error".into(),
                     reconnect: true,
-                }))
-                .await;
+                }));
                 return;
             }
         }

@@ -9,7 +9,7 @@ use crate::protocol::{proto, types::*};
 use crate::transport::{self, TransportFrame};
 
 impl ConnectionActor {
-    pub(super) async fn on_transport_close(&mut self, info: Option<transport::DisconnectInfo>) {
+    pub(super) fn on_transport_close(&mut self, info: Option<transport::DisconnectInfo>) {
         let info = info.unwrap_or(transport::DisconnectInfo {
             code: codes::connecting::TRANSPORT_CLOSED,
             reason: "transport closed".into(),
