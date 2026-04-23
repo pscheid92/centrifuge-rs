@@ -152,7 +152,11 @@ impl ConnectionActor {
     }
 
     async fn handle_disconnect_push(&mut self, disconnect: proto::Disconnect) {
-        let reconnect = disconnect.reconnect || codes::should_reconnect_on_disconnect(disconnect.code);
+        // Reconnect decision is defined purely by code ranges per the Centrifuge SDK
+        // spec (see additionals/client_sdk.md — "Disconnect codes"). The proto's
+        // `reconnect` field is ignored for push disconnects, matching the Go and JS
+        // reference SDKs (client.go:897-904, centrifuge.ts:1738-1745).
+        let reconnect = codes::should_reconnect_on_disconnect(disconnect.code);
         if reconnect {
             self.on_transport_close(Some(transport::DisconnectInfo {
                 code: disconnect.code,

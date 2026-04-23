@@ -259,6 +259,65 @@ async fn disconnect_push_terminal() {
     assert!(found);
 }
 
+// Terminal disconnect code (3500) with reconnect=true set on the push must still
+// be treated as terminal: the Centrifuge spec and the Go/JS SDKs decide reconnect
+// purely from the code range, ignoring the proto `reconnect` field on pushes.
+#[tokio::test]
+async fn disconnect_push_terminal_code_wins_over_reconnect_flag() {
+    let (client, mut conn, _) = make_client(default_config());
+    let mut events = client.events().expect("events");
+    connect_client(&client, &mut conn).await;
+
+    // Drain the startup Connecting/Connected events.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(drain_deadline) => break,
+            _ = events.recv() => {}
+        }
+    }
+
+    // Push a Disconnect with terminal code 3500 but reconnect=true on the proto.
+    // The proto reconnect flag must be ignored — code range wins.
+    conn.incoming_tx
+        .send(TransportFrame::Data(encode_reply(&serde_json::json!({
+            "push": {"disconnect": {"code": 3500, "reason": "banned", "reconnect": true}}
+        }))))
+        .await
+        .unwrap();
+
+    // Bounded total-duration drain. If the bug is live the client loops forever
+    // on reconnect errors, so a per-recv timeout would never expire.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let mut disconnected_code = None;
+    let mut saw_connecting = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            evt = events.recv() => match evt {
+                Some(centrifuge_client::ClientEvent::Disconnected(ctx)) => {
+                    disconnected_code = Some(ctx.code);
+                }
+                Some(centrifuge_client::ClientEvent::Connecting(_)) => {
+                    saw_connecting = true;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+
+    assert_eq!(
+        disconnected_code,
+        Some(3500),
+        "terminal code 3500 must produce Disconnected event, not a reconnect attempt"
+    );
+    assert!(
+        !saw_connecting,
+        "must not emit Connecting after a terminal disconnect push"
+    );
+}
+
 #[tokio::test]
 async fn message_push() {
     let (client, mut conn, _) = make_client(default_config());
