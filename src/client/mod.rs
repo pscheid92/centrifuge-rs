@@ -51,6 +51,11 @@ impl Client {
 
     /// Creates a new Client with a custom transport (useful for testing).
     pub fn new_with_transport(config: ClientConfig, transport: Box<dyn crate::transport::Transport>) -> Self {
+        debug_assert!(
+            config.validate().is_ok(),
+            "invalid ClientConfig: {:?}",
+            config.validate().err()
+        );
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let shared_state = Arc::new(AtomicU8::new(0));
         let actor = actor::ConnectionActor::new(config, cmd_rx, cmd_tx.clone(), transport, shared_state.clone());
@@ -129,6 +134,11 @@ impl Client {
         channel: impl Into<String>,
         config: SubscriptionConfig,
     ) -> Result<Subscription> {
+        debug_assert!(
+            config.validate().is_ok(),
+            "invalid SubscriptionConfig: {:?}",
+            config.validate().err()
+        );
         let channel = channel.into();
         request(&self.cmd_tx, |reply| actor::ActorCommand::NewSubscription {
             channel: channel.clone(),

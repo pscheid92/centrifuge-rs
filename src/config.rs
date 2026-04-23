@@ -125,6 +125,24 @@ impl ClientConfig {
         }
     }
 
+    /// Validate the configuration. Called automatically via `debug_assert!`
+    /// in `Client::new`, but exposed for callers who want to proactively
+    /// surface misconfiguration in release builds too.
+    pub fn validate(&self) -> Result<(), CentrifugeError> {
+        if self.url.is_empty() {
+            return Err(CentrifugeError::BadConfiguration("url must not be empty".into()));
+        }
+        if self.min_reconnect_delay > self.max_reconnect_delay {
+            return Err(CentrifugeError::BadConfiguration(
+                "min_reconnect_delay must be <= max_reconnect_delay".into(),
+            ));
+        }
+        if self.timeout.is_zero() {
+            return Err(CentrifugeError::BadConfiguration("timeout must be > 0".into()));
+        }
+        Ok(())
+    }
+
     pub fn protocol_type(mut self, pt: ProtocolType) -> Self {
         self.protocol_type = pt;
         self
@@ -219,6 +237,17 @@ pub struct SubscriptionConfig {
 }
 
 impl SubscriptionConfig {
+    /// Validate the configuration. Called automatically via `debug_assert!`
+    /// in `Client::new_subscription`.
+    pub fn validate(&self) -> Result<(), CentrifugeError> {
+        if self.min_resubscribe_delay > self.max_resubscribe_delay {
+            return Err(CentrifugeError::BadConfiguration(
+                "min_resubscribe_delay must be <= max_resubscribe_delay".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn recoverable(mut self) -> Self {
         self.recoverable = true;
         self
@@ -411,6 +440,31 @@ mod tests {
         assert!(cloned.get_token.is_some());
         assert!(cloned.get_data.is_some());
         assert_eq!(cloned.url, "ws://test");
+    }
+
+    #[test]
+    fn test_client_config_validate_rejects_empty_url() {
+        let cfg = ClientConfig::default();
+        assert!(matches!(cfg.validate(), Err(CentrifugeError::BadConfiguration(_))));
+    }
+
+    #[test]
+    fn test_client_config_validate_rejects_min_gt_max_delay() {
+        let cfg = ClientConfig::new("ws://test")
+            .min_reconnect_delay(Duration::from_secs(30))
+            .max_reconnect_delay(Duration::from_secs(5));
+        assert!(matches!(cfg.validate(), Err(CentrifugeError::BadConfiguration(_))));
+    }
+
+    #[test]
+    fn test_client_config_validate_rejects_zero_timeout() {
+        let cfg = ClientConfig::new("ws://test").timeout(Duration::ZERO);
+        assert!(matches!(cfg.validate(), Err(CentrifugeError::BadConfiguration(_))));
+    }
+
+    #[test]
+    fn test_client_config_validate_accepts_good_config() {
+        assert!(ClientConfig::new("ws://localhost").validate().is_ok());
     }
 
     #[test]
