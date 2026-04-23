@@ -7,6 +7,7 @@ use tracing::{debug, trace, warn};
 use super::actor::{ConnectionActor, PendingRequest};
 use crate::backoff;
 use crate::codes;
+use crate::config::DeltaType;
 use crate::errors::{CentrifugeError, Result};
 use crate::protocol::{proto, types::*};
 use crate::transport::{self, TransportFrame};
@@ -172,6 +173,8 @@ impl ConnectionActor {
         let id = self.next_cmd_id();
         let mut subs_map = HashMap::new();
 
+        // Server-side subs: include recoverable ones so the server can replay
+        // missed publications as part of ConnectResult.subs.
         for (channel, sub) in &self.server_subs {
             if sub.recoverable {
                 subs_map.insert(
@@ -184,6 +187,45 @@ impl ConnectionActor {
                     },
                 );
             }
+        }
+
+        // Client-side subs in Subscribing state: batch them into the Connect
+        // command so the server resolves them in ConnectResult.subs, saving N
+        // separate Subscribe round-trips on reconnect. Matches JS's
+        // startBatching + _sendSubscribeCommands + stopBatching pattern
+        // around the connect reply (centrifuge.ts:1507-1509).
+        //
+        // Skip subs whose token or data callback still needs to run — let
+        // do_subscribe handle them via the regular path, since the callback
+        // is async and we can't block the handshake on it here.
+        for (channel, sub) in &self.subs {
+            if sub.state != SubscriptionState::Subscribing {
+                continue;
+            }
+            let needs_token = sub.token.is_empty() && sub.config.get_token.is_some();
+            if needs_token || sub.config.get_data.is_some() {
+                continue;
+            }
+            subs_map.insert(
+                channel.clone(),
+                proto::SubscribeRequest {
+                    channel: channel.clone(),
+                    token: sub.token.clone(),
+                    recover: sub.recover && (sub.offset > 0 || !sub.epoch.is_empty()),
+                    epoch: sub.epoch.clone(),
+                    offset: sub.offset,
+                    data: sub.config.data.clone(),
+                    positioned: sub.config.positioned,
+                    recoverable: sub.config.recoverable,
+                    join_leave: sub.config.join_leave,
+                    delta: match sub.config.delta {
+                        DeltaType::Fossil => "fossil".into(),
+                        DeltaType::None => String::new(),
+                    },
+                    tf: sub.config.tags_filter.clone(),
+                    ..Default::default()
+                },
+            );
         }
 
         let cmd = proto::Command {

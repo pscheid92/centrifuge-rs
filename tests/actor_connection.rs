@@ -432,6 +432,107 @@ async fn reconnect_resubscribes_active_subscriptions() {
     assert_eq!(subscribed_count, 2);
 }
 
+// Reconnect batches client-side subscribes into the Connect command (the
+// ConnectRequest.subs map), and the server's ConnectResult.subs response
+// can resolve them without a second Subscribe round-trip. Matches JS's
+// startBatching/stopBatching around _sendConnect + _sendSubscribeCommands
+// (centrifuge.ts:1507-1509).
+#[tokio::test]
+async fn reconnect_batches_client_sub_into_handshake() {
+    let (transport, conn) = MockTransport::new();
+    let mut conn2 = transport.add_connection();
+    let client = Client::new_with_transport(default_config(), Box::new(ArcTransport(transport)));
+
+    let sub = client
+        .new_subscription("ch", centrifuge_client::config::SubscriptionConfig::default())
+        .await
+        .unwrap();
+    let mut events = sub.events().expect("events");
+
+    // Initial connect + subscribe.
+    let c = client.clone();
+    let task = tokio::spawn(async move { c.connect().await });
+    let mut first = MockConnection {
+        incoming_tx: conn.incoming_tx.clone(),
+        outgoing_rx: conn.outgoing_rx,
+    };
+    do_connect(&mut first).await;
+    task.await.unwrap().unwrap();
+    time::sleep(Duration::from_millis(20)).await;
+    subscribe_sub(&sub, &mut first).await;
+
+    // Drain startup events.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(drain_deadline) => break,
+            _ = events.recv() => {}
+        }
+    }
+
+    // Trigger reconnect.
+    conn.incoming_tx
+        .send(TransportFrame::Close(Some(DisconnectInfo {
+            code: 3001,
+            reason: "restart".into(),
+            reconnect: true,
+        })))
+        .await
+        .unwrap();
+
+    // Read the reconnect Connect command — it must include the client sub
+    // inside ConnectRequest.subs instead of deferring it to a separate
+    // Subscribe command.
+    let cmd = read_command(&mut conn2).await;
+    let id = cmd["id"].as_u64().unwrap() as u32;
+    assert!(
+        cmd["connect"]["subs"]["ch"].is_object(),
+        "reconnect handshake must batch client-side subs into ConnectRequest.subs, got: {cmd}"
+    );
+
+    // Reply with a ConnectResult.subs that resolves the client sub.
+    conn2
+        .incoming_tx
+        .send(TransportFrame::Data(encode_reply(&serde_json::json!({
+            "id": id,
+            "connect": {
+                "client": "test-client-id", "version": "1.0.0", "ping": 25, "pong": true,
+                "subs": { "ch": {} }
+            }
+        }))))
+        .await
+        .unwrap();
+
+    // Sub transitions to Subscribed via the batched response.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let mut saw_subscribed = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            evt = events.recv() => match evt {
+                Some(centrifuge_client::SubEvent::Subscribed(_)) => {
+                    saw_subscribed = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    assert!(
+        saw_subscribed,
+        "client sub must transition to Subscribed via the batched handshake response"
+    );
+
+    // No separate Subscribe command must appear — the handshake response
+    // alone should have satisfied the resubscribe.
+    let extra = time::timeout(Duration::from_millis(100), conn2.outgoing_rx.recv()).await;
+    assert!(
+        extra.is_err(),
+        "no separate Subscribe command expected after a batched handshake, got: {extra:?}"
+    );
+}
+
 // =========================================================================
 // O. Close while connecting
 // =========================================================================

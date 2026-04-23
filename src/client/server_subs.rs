@@ -3,10 +3,22 @@ use crate::codes;
 use crate::protocol::{proto, types::*};
 
 impl ConnectionActor {
+    /// Route each channel in `result.subs` to the appropriate path:
+    /// client-side subs (in `self.subs`) go through `handle_subscribe_success`,
+    /// server-side subs go through the registry-plus-ServerSubscribed path.
+    /// Also emits ServerUnsubscribed for old server subs missing from the
+    /// new ConnectResult.
     pub(super) fn process_server_subs(&mut self, result: &proto::ConnectResult) {
-        let old_channels: Vec<String> = self.server_subs.keys().cloned().collect();
+        let old_server_channels: Vec<String> = self.server_subs.keys().cloned().collect();
 
         for (channel, sub_result) in &result.subs {
+            if self.subs.contains_key(channel) {
+                // Client-side sub batched into the handshake — resolve it.
+                self.handle_subscribe_success(channel, sub_result);
+                continue;
+            }
+
+            // Server-side sub.
             let was_recovering = self.server_subs.contains_key(channel);
 
             self.server_subs.insert(
@@ -49,7 +61,7 @@ impl ConnectionActor {
             }
         }
 
-        for channel in old_channels {
+        for channel in old_server_channels {
             if !result.subs.contains_key(&channel) {
                 self.server_subs.remove(&channel);
                 self.emit_client_event(ClientEvent::ServerUnsubscribed(ServerUnsubscribedContext {
