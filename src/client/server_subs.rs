@@ -1,4 +1,5 @@
 use super::actor::{ConnectionActor, ServerSubState};
+use crate::codes;
 use crate::protocol::{proto, types::*};
 
 impl ConnectionActor {
@@ -53,7 +54,7 @@ impl ConnectionActor {
                 self.server_subs.remove(&channel);
                 self.emit_client_event(ClientEvent::ServerUnsubscribed(ServerUnsubscribedContext {
                     channel,
-                    code: 0,
+                    code: codes::unsubscribed::SERVER_SUB_REMOVED,
                     reason: "subscription not found after reconnect".into(),
                 }));
             }

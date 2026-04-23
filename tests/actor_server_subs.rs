@@ -99,10 +99,16 @@ async fn server_sub_disappears_on_reconnect() {
     let mut unsubs = Vec::new();
     while let Ok(Some(e)) = time::timeout(Duration::from_millis(200), events.recv()).await {
         if let centrifuge_client::ClientEvent::ServerUnsubscribed(ctx) = e {
-            unsubs.push(ctx.channel);
+            unsubs.push((ctx.channel, ctx.code));
         }
     }
-    assert!(unsubs.contains(&"notif".to_string()));
+    // Code 3 is codes::unsubscribed::SERVER_SUB_REMOVED — a named sentinel
+    // that distinguishes "server silently removed this sub during reconnect"
+    // from code 0 (UNSUBSCRIBE_CALLED, reserved for user-triggered unsubs).
+    assert!(
+        unsubs.iter().any(|(ch, code)| ch == "notif" && *code == 3),
+        "expected ServerUnsubscribed with code=3 for notif, got {unsubs:?}"
+    );
 }
 
 // =========================================================================

@@ -26,6 +26,9 @@ pub mod unsubscribed {
     pub const UNSUBSCRIBE_CALLED: u32 = 0;
     pub const UNAUTHORIZED: u32 = 1;
     pub const CLIENT_CLOSED: u32 = 2;
+    /// A server-side subscription previously in the registry was absent from
+    /// the ConnectResult after a reconnect — the server effectively removed it.
+    pub const SERVER_SUB_REMOVED: u32 = 3;
 }
 
 /// Returns true if the server disconnect code indicates the client should reconnect.
