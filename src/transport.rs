@@ -191,7 +191,11 @@ fn spawn_ws_task<S>(
                 let msg = if is_binary {
                     Message::Binary(data.into())
                 } else {
-                    Message::Text(String::from_utf8_lossy(&data).into_owned().into())
+                    // serde_json always emits valid UTF-8, so from_utf8 can't
+                    // fail here. _lossy would silently replace bytes with
+                    // U+FFFD on a codec bug, corrupting the frame.
+                    let text = String::from_utf8(data).expect("json codec must emit valid UTF-8");
+                    Message::Text(text.into())
                 };
                 if sink.send(msg).await.is_err() {
                     break;
