@@ -15,7 +15,7 @@ pub enum CentrifugeError {
     #[error("unauthorized")]
     Unauthorized,
     #[error("transport error: {0}")]
-    Transport(Box<dyn std::error::Error + Send + Sync>),
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("bad configuration: {0}")]
@@ -49,5 +49,18 @@ mod tests {
     fn test_error_trait() {
         let err: Box<dyn std::error::Error> = Box::new(CentrifugeError::Timeout);
         assert_eq!(err.to_string(), "operation timed out");
+    }
+
+    // Transport errors must expose the inner error via std::error::Error::source
+    // so downstream code can walk the chain (e.g. anyhow, eyre).
+    #[test]
+    fn test_transport_preserves_source() {
+        use std::error::Error as _;
+        let inner: Box<dyn std::error::Error + Send + Sync> = "connection refused".into();
+        let err = CentrifugeError::Transport(inner);
+        let src = err.source().expect("Transport must expose source");
+        assert_eq!(src.to_string(), "connection refused");
+        // Display still shows the inner message for convenience.
+        assert_eq!(err.to_string(), "transport error: connection refused");
     }
 }
