@@ -7,7 +7,7 @@ use tokio::time;
 
 use centrifuge_client::CentrifugeError;
 use centrifuge_client::config::SubscriptionConfig;
-use centrifuge_client::transport::TransportFrame;
+use centrifuge_client::transport::{DisconnectInfo, TransportFrame};
 
 // =========================================================================
 // D. Request/Reply Commands
@@ -423,4 +423,78 @@ async fn batching_sends_commands_as_single_frame() {
     t2.await.unwrap().unwrap();
 
     client.disconnect().await.unwrap();
+}
+
+// If the transport drops while a batch is open, the queued bytes must be
+// discarded rather than carried over to the next connection. The pending
+// request table is already cleared by fail_all_pending on disconnect, so
+// leftover batched commands would be sent with ids the client no longer
+// tracks — the server's replies come back as "unknown id" and the caller's
+// future was already resolved with an error. JS has a similar structural
+// quirk but its _transportIsOpen flag prevents the stale flush from going
+// out; Rust's flush only checks `self.sink.is_some()` so after reconnect
+// the bytes land on the new connection. Clearing the queue alongside
+// fail_all_pending is the defensive fix.
+#[tokio::test]
+async fn batch_queue_cleared_on_transport_close() {
+    use centrifuge_client::Client;
+
+    let (transport, conn_initial) = MockTransport::new();
+    let mut conn2 = transport.add_connection();
+    let client = Client::new_with_transport(default_config(), Box::new(ArcTransport(transport)));
+
+    // Initial connect.
+    let mut conn = MockConnection {
+        incoming_tx: conn_initial.incoming_tx.clone(),
+        outgoing_rx: conn_initial.outgoing_rx,
+    };
+    let c = client.clone();
+    let task = tokio::spawn(async move { c.connect().await });
+    do_connect(&mut conn).await;
+    task.await.unwrap().unwrap();
+    time::sleep(Duration::from_millis(20)).await;
+
+    // Start a batch and queue a publish. Publish awaits the server reply and
+    // will be failed when fail_all_pending fires during disconnect.
+    client.start_batching();
+    time::sleep(Duration::from_millis(10)).await;
+
+    let c = client.clone();
+    let pub_task = tokio::spawn(async move { c.publish("ch", br#"{"msg":"queued"}"#.to_vec()).await });
+    time::sleep(Duration::from_millis(30)).await;
+
+    // Sanity: nothing on the wire yet (batch still open).
+    let nothing_yet = time::timeout(Duration::from_millis(30), conn.outgoing_rx.recv()).await;
+    assert!(nothing_yet.is_err(), "command must still be queued");
+
+    // Force a transport close with reconnect.
+    conn.incoming_tx
+        .send(TransportFrame::Close(Some(DisconnectInfo {
+            code: 3001,
+            reason: "transport closed".into(),
+            reconnect: true,
+        })))
+        .await
+        .unwrap();
+
+    // Pending publish resolves with an error.
+    let pub_result = pub_task.await.unwrap();
+    assert!(
+        pub_result.is_err(),
+        "publish must be failed on transport close, got: {pub_result:?}"
+    );
+
+    // Let the actor move through on_transport_close → move_to_connecting →
+    // do_connect_cycle before we drive the reconnect handshake on conn2.
+    time::sleep(Duration::from_millis(30)).await;
+    do_connect(&mut conn2).await;
+    time::sleep(Duration::from_millis(30)).await;
+
+    // Stop batching — no stale bytes must flush to the new connection.
+    client.stop_batching();
+    let stale = time::timeout(Duration::from_millis(80), conn2.outgoing_rx.recv()).await;
+    assert!(
+        stale.is_err(),
+        "batched bytes from before disconnect must not be sent on the new connection, got: {stale:?}"
+    );
 }

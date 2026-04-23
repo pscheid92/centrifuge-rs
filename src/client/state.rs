@@ -58,6 +58,8 @@ impl ConnectionActor {
         self.sink = None;
         self.stream = None;
         self.fail_all_pending();
+        self.batch.active = false;
+        self.batch.queue.clear();
 
         for w in self.connect_waiters.drain(..) {
             let _ = w.send(Err(CentrifugeError::ClientDisconnected));
@@ -93,6 +95,8 @@ impl ConnectionActor {
         self.sink = None;
         self.stream = None;
         self.fail_all_pending();
+        self.batch.active = false;
+        self.batch.queue.clear();
         for w in self.connect_waiters.drain(..) {
             let _ = w.send(Err(CentrifugeError::ClientClosed));
         }

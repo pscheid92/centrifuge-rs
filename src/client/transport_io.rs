@@ -19,6 +19,14 @@ impl ConnectionActor {
         self.sink = None;
         self.stream = None;
         self.fail_all_pending();
+        // A batch is tied to a connection. Discard any queued bytes (whose
+        // pending entries were just cleared) and reset `active` so the
+        // reconnect handshake's send_command doesn't land back in the queue
+        // while we're trying to hand-shake on the new transport. User's
+        // paired stop_batching becomes a no-op, matching JS's reconnect
+        // path which also force-resets _batching (centrifuge.ts:812-815).
+        self.batch.active = false;
+        self.batch.queue.clear();
 
         if info.reconnect && self.connect_requested {
             for sub in self.subs.values_mut() {
