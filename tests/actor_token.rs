@@ -20,7 +20,7 @@ async fn connection_token_refresh_during_connected() {
     let refresh_called = Arc::new(AtomicU32::new(0));
     let rc = refresh_called.clone();
     let config = ClientConfig {
-        get_token: Some(Box::new(move || {
+        get_token: Some(Arc::new(move || {
             let rc = rc.clone();
             Box::pin(async move {
                 rc.fetch_add(1, Ordering::Relaxed);
@@ -71,7 +71,7 @@ async fn subscription_token_refresh_during_subscribed() {
             "ch",
             SubscriptionConfig {
                 token: "sub-tok".into(),
-                get_token: Some(Box::new(move |_| {
+                get_token: Some(Arc::new(move |_| {
                     let tc = tc2.clone();
                     Box::pin(async move {
                         tc.fetch_add(1, Ordering::Relaxed);
@@ -122,7 +122,7 @@ async fn subscription_token_refresh_during_subscribed() {
 async fn token_refresh_unauthorized_during_connected_disconnects() {
     let config = ClientConfig {
         token: "initial".into(),
-        get_token: Some(Box::new(|| {
+        get_token: Some(Arc::new(|| {
             // Always returns unauthorized -- called only during refresh (not connect, since token is set)
             Box::pin(async { Err(CentrifugeError::Unauthorized) })
         })),
@@ -160,7 +160,7 @@ async fn token_refresh_unauthorized_during_connected_disconnects() {
 async fn token_refresh_generic_error_retries() {
     let config = ClientConfig {
         token: "initial".into(),
-        get_token: Some(Box::new(|| {
+        get_token: Some(Arc::new(|| {
             Box::pin(async { Err(CentrifugeError::Transport("network down".into())) })
         })),
         ..default_config()
@@ -201,7 +201,7 @@ async fn sub_token_refresh_empty_unsubscribes() {
             "ch",
             SubscriptionConfig {
                 token: "sub-tok".into(),
-                get_token: Some(Box::new(|_| {
+                get_token: Some(Arc::new(|_| {
                     Box::pin(async { Ok(String::new()) }) // always empty -> unauthorized
                 })),
                 ..Default::default()
@@ -245,7 +245,7 @@ async fn sub_token_refresh_unauthorized_unsubscribes() {
             "ch",
             SubscriptionConfig {
                 token: "sub-tok".into(),
-                get_token: Some(Box::new(|_| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
+                get_token: Some(Arc::new(|_| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
                 ..Default::default()
             },
         )
@@ -286,7 +286,7 @@ async fn sub_token_refresh_error_retries() {
             "ch",
             SubscriptionConfig {
                 token: "sub-tok".into(),
-                get_token: Some(Box::new(|_| {
+                get_token: Some(Arc::new(|_| {
                     Box::pin(async { Err(CentrifugeError::Transport("fail".into())) })
                 })),
                 ..Default::default()
@@ -332,7 +332,7 @@ async fn bug3_token_refresh_before_ttl_expires() {
     let rt = refresh_time.clone();
 
     let config = ClientConfig {
-        get_token: Some(Box::new(move || {
+        get_token: Some(Arc::new(move || {
             let rt = rt.clone();
             Box::pin(async move {
                 *rt.lock().unwrap() = Some(std::time::Instant::now());

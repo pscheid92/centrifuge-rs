@@ -243,7 +243,7 @@ async fn jwt_connect_with_get_token_callback() {
 
     let client = Client::new(
         ClientConfig::new(&server.ws_url)
-            .get_token(Box::new(move || {
+            .get_token(Arc::new(move || {
                 let tc = tc.clone();
                 Box::pin(async move {
                     tc.fetch_add(1, Ordering::Relaxed);
@@ -278,7 +278,7 @@ async fn jwt_token_refresh_on_expiration() {
     let client = Client::new(
         ClientConfig::new(&server.ws_url)
             .token(make_short_lived_token("refresh-user", 5))
-            .get_token(Box::new(move || {
+            .get_token(Arc::new(move || {
                 let rc = rc.clone();
                 Box::pin(async move {
                     rc.fetch_add(1, Ordering::Relaxed);
@@ -298,7 +298,7 @@ async fn jwt_unauthorized_callback_disconnects() {
 
     let client = Client::new(
         ClientConfig::new(&server.ws_url)
-            .get_token(Box::new(|| Box::pin(async { Err(CentrifugeError::Unauthorized) })))
+            .get_token(Arc::new(|| Box::pin(async { Err(CentrifugeError::Unauthorized) })))
             .timeout(Duration::from_secs(2)),
     );
     let mut events = client.events().expect("events");

@@ -126,7 +126,7 @@ async fn connect_token_expired_triggers_refresh() {
     let refreshed = Arc::new(Mutex::new(false));
     let r = refreshed.clone();
     let config = ClientConfig {
-        get_token: Some(Box::new(move || {
+        get_token: Some(Arc::new(move || {
             let r = r.clone();
             Box::pin(async move {
                 *r.lock().unwrap() = true;
@@ -164,7 +164,7 @@ async fn connect_token_expired_triggers_refresh() {
 #[tokio::test]
 async fn connect_unauthorized_token_disconnects() {
     let config = ClientConfig {
-        get_token: Some(Box::new(|| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
+        get_token: Some(Arc::new(|| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
         token: String::new(),
         ..default_config()
     };

@@ -491,7 +491,7 @@ async fn subscribe_token_expired_refreshes_and_retries() {
             "ch",
             SubscriptionConfig {
                 token: "old-token".into(),
-                get_token: Some(Box::new(move |_channel| {
+                get_token: Some(Arc::new(move |_channel| {
                     let tc = tc.clone();
                     Box::pin(async move {
                         tc.fetch_add(1, Ordering::Relaxed);
@@ -858,7 +858,7 @@ async fn bug6_subscribe_waiter_resolved_on_token_failure_during_resubscribe() {
         .new_subscription(
             "ch",
             SubscriptionConfig {
-                get_token: Some(Box::new(|_| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
+                get_token: Some(Arc::new(|_| Box::pin(async { Err(CentrifugeError::Unauthorized) }))),
                 ..Default::default()
             },
         )
@@ -939,7 +939,7 @@ async fn do_subscribe_token_error_retries() {
         .new_subscription(
             "ch",
             SubscriptionConfig {
-                get_token: Some(Box::new(move |_| {
+                get_token: Some(Arc::new(move |_| {
                     let cc = cc.clone();
                     Box::pin(async move {
                         cc.fetch_add(1, Ordering::Relaxed);

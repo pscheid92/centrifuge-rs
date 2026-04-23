@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::errors::CentrifugeError;
@@ -22,16 +23,18 @@ pub enum ProtocolType {
 // ---------------------------------------------------------------------------
 
 /// Async callback for obtaining/refreshing a connection token.
-pub type GetTokenFn = Box<dyn Fn() -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
+///
+/// Held behind `Arc` so `ClientConfig`/`SubscriptionConfig` can be `Clone`.
+pub type GetTokenFn = Arc<dyn Fn() -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
 
 /// Async callback for obtaining/refreshing a subscription token.
-pub type GetSubscriptionTokenFn = Box<dyn Fn(String) -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
+pub type GetSubscriptionTokenFn = Arc<dyn Fn(String) -> BoxFuture<Result<String, CentrifugeError>> + Send + Sync>;
 
 /// Async callback for obtaining fresh connection data on each connect attempt.
-pub type GetDataFn = Box<dyn Fn() -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
+pub type GetDataFn = Arc<dyn Fn() -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
 
 /// Async callback for obtaining fresh subscription data on each subscribe attempt.
-pub type GetSubDataFn = Box<dyn Fn(String) -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
+pub type GetSubDataFn = Arc<dyn Fn(String) -> BoxFuture<Result<Vec<u8>, CentrifugeError>> + Send + Sync>;
 
 /// Helper to create a [`GetTokenFn`] without double-boxing boilerplate.
 ///
@@ -46,7 +49,7 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, CentrifugeError>> + Send + 'static,
 {
-    Box::new(move || Box::pin(f()))
+    Arc::new(move || Box::pin(f()))
 }
 
 /// Helper to create a [`GetSubscriptionTokenFn`] without double-boxing boilerplate.
@@ -55,7 +58,7 @@ where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<String, CentrifugeError>> + Send + 'static,
 {
-    Box::new(move |channel| Box::pin(f(channel)))
+    Arc::new(move |channel| Box::pin(f(channel)))
 }
 
 /// Helper to create a [`GetDataFn`] without double-boxing boilerplate.
@@ -64,7 +67,7 @@ where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Vec<u8>, CentrifugeError>> + Send + 'static,
 {
-    Box::new(move || Box::pin(f()))
+    Arc::new(move || Box::pin(f()))
 }
 
 /// Helper to create a [`GetSubDataFn`] without double-boxing boilerplate.
@@ -73,10 +76,11 @@ where
     F: Fn(String) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Vec<u8>, CentrifugeError>> + Send + 'static,
 {
-    Box::new(move |channel| Box::pin(f(channel)))
+    Arc::new(move |channel| Box::pin(f(channel)))
 }
 
 /// Configuration for creating a Client.
+#[derive(Clone)]
 pub struct ClientConfig {
     pub url: String,
     pub protocol_type: ProtocolType,
@@ -198,6 +202,7 @@ pub enum DeltaType {
 }
 
 /// Configuration for creating a Subscription.
+#[derive(Clone)]
 pub struct SubscriptionConfig {
     pub token: String,
     pub get_token: Option<GetSubscriptionTokenFn>,
@@ -395,5 +400,26 @@ mod tests {
     #[test]
     fn test_delta_type_default() {
         assert_eq!(DeltaType::default(), DeltaType::None);
+    }
+
+    #[test]
+    fn test_client_config_clone_preserves_callbacks() {
+        let config = ClientConfig::new("ws://test")
+            .get_token(get_token_fn(|| async { Ok("t".into()) }))
+            .get_data(get_data_fn(|| async { Ok(b"d".to_vec()) }));
+        let cloned = config.clone();
+        assert!(cloned.get_token.is_some());
+        assert!(cloned.get_data.is_some());
+        assert_eq!(cloned.url, "ws://test");
+    }
+
+    #[test]
+    fn test_subscription_config_clone_preserves_callbacks() {
+        let config = SubscriptionConfig::default()
+            .get_token(get_sub_token_fn(|_| async { Ok("t".into()) }))
+            .get_data(get_sub_data_fn(|_| async { Ok(b"d".to_vec()) }));
+        let cloned = config.clone();
+        assert!(cloned.get_token.is_some());
+        assert!(cloned.get_data.is_some());
     }
 }
