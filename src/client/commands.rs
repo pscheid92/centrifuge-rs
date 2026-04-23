@@ -135,6 +135,16 @@ impl ConnectionActor {
             return;
         }
 
+        // Already in-flight — attach to the existing attempt so both callers
+        // resolve together, and do not re-emit Subscribing or reset the
+        // backoff counter mid-backoff. Matches Go (subscription.go:401-407)
+        // and JS (subscription.ts:319-322), which both early-return from
+        // Subscribing.
+        if sub.state == SubscriptionState::Subscribing {
+            sub.subscribe_waiters.push(reply);
+            return;
+        }
+
         sub.state = SubscriptionState::Subscribing;
         sub.resubscribe_attempts = 0;
         sub.emit(SubEvent::Subscribing(SubscribingContext {

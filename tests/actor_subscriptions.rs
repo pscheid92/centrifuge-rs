@@ -35,6 +35,76 @@ async fn new_subscription_and_subscribe() {
     );
 }
 
+// A second subscribe() while the sub is already in the Subscribing state must
+// be a no-op: no duplicate Subscribing event, no duplicate wire subscribe
+// command, both awaiting callers resolve together when the first server reply
+// arrives. Matches Go subscription.go:401-407 and JS subscription.ts:319-322,
+// both of which early-return on Subscribing.
+#[tokio::test]
+async fn subscribe_while_already_subscribing_is_idempotent() {
+    let (client, mut conn, _) = make_client(default_config());
+    let sub = client
+        .new_subscription("ch", SubscriptionConfig::default())
+        .await
+        .unwrap();
+    let mut events = sub.events().expect("events");
+    connect_client(&client, &mut conn).await;
+
+    // First subscribe — kicks off the wire command; don't reply yet so the
+    // sub stays in Subscribing state.
+    let sub1 = sub.clone();
+    let first = tokio::spawn(async move { sub1.subscribe().await });
+
+    let cmd1 = read_command(&mut conn).await;
+    assert!(cmd1.get("subscribe").is_some(), "first subscribe must hit the wire");
+    let id = cmd1["id"].as_u64().unwrap() as u32;
+
+    // Second subscribe() while the first is still pending.
+    let sub2 = sub.clone();
+    let second = tokio::spawn(async move { sub2.subscribe().await });
+
+    // Give the actor a moment to process the second call.
+    time::sleep(Duration::from_millis(30)).await;
+
+    // No additional wire command must appear.
+    let extra = time::timeout(Duration::from_millis(50), conn.outgoing_rx.recv()).await;
+    assert!(
+        extra.is_err(),
+        "a second subscribe() while Subscribing must not send a duplicate wire command"
+    );
+
+    // Reply to the first subscribe.
+    conn.incoming_tx
+        .send(TransportFrame::Data(encode_reply(&serde_json::json!({
+            "id": id, "subscribe": {}
+        }))))
+        .await
+        .unwrap();
+
+    // Both awaiting callers resolve with Ok.
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    // Exactly one Subscribing event and one Subscribed event on the sub's
+    // event stream.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let mut subscribing_count = 0u32;
+    let mut subscribed_count = 0u32;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            evt = events.recv() => match evt {
+                Some(centrifuge_client::SubEvent::Subscribing(_)) => subscribing_count += 1,
+                Some(centrifuge_client::SubEvent::Subscribed(_)) => subscribed_count += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    assert_eq!(subscribing_count, 1, "expected exactly one Subscribing event");
+    assert_eq!(subscribed_count, 1, "expected exactly one Subscribed event");
+}
+
 #[tokio::test]
 async fn duplicate_subscription_error() {
     let (client, _conn, _) = make_client(default_config());
