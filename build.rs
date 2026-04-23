@@ -24,8 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "centrifugal.centrifuge.protocol.RPCResult.data",
         "centrifugal.centrifuge.protocol.SendRequest.data",
     ];
+    // `skip_serializing_if = "Vec::is_empty"` — omit empty byte fields from
+    // the JSON wire format (matches proto3 JSON conventions and the Centrifuge
+    // Go/JS SDKs). Without this, empty `data` fields serialize as `"data": null`.
     for field in &bytes_fields {
-        config.field_attribute(field, "#[serde(with = \"crate::codec::embedded_json\")]");
+        config.field_attribute(
+            field,
+            "#[serde(with = \"crate::codec::embedded_json\", skip_serializing_if = \"Vec::is_empty\")]",
+        );
     }
 
     // The Push message has a field named "pub", which is a Rust keyword.

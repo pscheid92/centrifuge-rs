@@ -260,6 +260,50 @@ mod tests {
         assert_eq!(parsed["publish"]["data"]["msg"], "hello");
     }
 
+    // Empty byte fields must be omitted from the JSON output — matches
+    // proto3 JSON conventions and the external Go encoder used by the Go SDK
+    // (protocol.NewJSONCommandEncoder). Previously emitted `"data": null`,
+    // which is not what Centrifugo's other client SDKs produce for an empty
+    // payload.
+    #[test]
+    fn test_json_empty_data_field_is_omitted() {
+        let cmd = proto::Command {
+            id: 1,
+            publish: Some(proto::PublishRequest {
+                channel: "ch".into(),
+                data: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["publish"].get("data").is_none(),
+            "empty PublishRequest.data must be omitted from JSON, got: {json}"
+        );
+        assert_eq!(parsed["publish"]["channel"], "ch");
+    }
+
+    #[test]
+    fn test_json_empty_connect_data_is_omitted() {
+        let cmd = proto::Command {
+            id: 1,
+            connect: Some(proto::ConnectRequest {
+                token: "t".into(),
+                name: "rs".into(),
+                data: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["connect"].get("data").is_none(),
+            "empty ConnectRequest.data must be omitted from JSON, got: {json}"
+        );
+    }
+
     #[test]
     fn test_json_embedded_data_decode() {
         let json = r#"{"push":{"channel":"ch","pub":{"data":{"msg":"world"}}}}"#;
