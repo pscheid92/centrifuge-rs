@@ -72,9 +72,9 @@ fn map_close_code(code: u16, reason: String) -> DisconnectInfo {
             reconnect: false,
         },
         c if c >= 3000 => DisconnectInfo {
-            code: c as u32,
+            code: u32::from(c),
             reason,
-            reconnect: codes::should_reconnect_on_disconnect(c as u32),
+            reconnect: codes::should_reconnect_on_disconnect(u32::from(c)),
         },
         _ => DisconnectInfo {
             code: codes::connecting::TRANSPORT_CLOSED,

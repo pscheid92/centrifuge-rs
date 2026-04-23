@@ -255,15 +255,14 @@ impl ConnectionActor {
                     }
                 }
                 _ = time::sleep_until(deadline) => {
-                    if Instant::now() >= deadline {
-                        debug!("ping timeout");
-                        self.on_transport_close(Some(transport::DisconnectInfo {
-                            code: codes::connecting::NO_PING,
-                            reason: "no ping".into(),
-                            reconnect: true,
-                        }));
-                        return;
-                    }
+                    // sleep_until doesn't return early, so we're past the deadline.
+                    debug!("ping timeout");
+                    self.on_transport_close(Some(transport::DisconnectInfo {
+                        code: codes::connecting::NO_PING,
+                        reason: "no ping".into(),
+                        reconnect: true,
+                    }));
+                    return;
                 }
             }
         }

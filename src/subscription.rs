@@ -187,7 +187,7 @@ impl SubState {
     pub fn new(config: SubscriptionConfig) -> Self {
         let token = config.token.clone();
         let recover = config.since.is_some() || config.recoverable;
-        let offset = config.since.as_ref().map(|s| s.offset).unwrap_or(0);
+        let offset = config.since.as_ref().map_or(0, |s| s.offset);
         let epoch = config.since.as_ref().map(|s| s.epoch.clone()).unwrap_or_default();
         Self {
             config,
@@ -223,7 +223,7 @@ impl SubState {
         if is_delta {
             match crate::delta::apply_delta(&self.prev_data, &raw_data) {
                 Ok(full_data) => {
-                    self.prev_data = full_data.clone();
+                    self.prev_data.clone_from(&full_data);
                     full_data
                 }
                 Err(e) => {
@@ -232,7 +232,7 @@ impl SubState {
                 }
             }
         } else {
-            self.prev_data = raw_data.clone();
+            self.prev_data.clone_from(&raw_data);
             raw_data
         }
     }
