@@ -38,6 +38,7 @@ impl ConnectionActor {
     }
 
     pub(super) fn handle_subscribe_success(&mut self, channel: &str, result: &proto::SubscribeResult) {
+        let protocol_type = self.config.protocol_type;
         let Some(sub) = self.subs.get_mut(channel) else { return };
         let was_recovering = sub.recover && (sub.offset > 0 || !sub.epoch.is_empty());
 
@@ -77,7 +78,7 @@ impl ConnectionActor {
             if pub_msg.offset > 0 {
                 sub.offset = pub_msg.offset;
             }
-            let data = sub.apply_delta(&pub_msg.data, pub_msg.delta);
+            let data = sub.apply_delta(&pub_msg.data, pub_msg.delta, protocol_type);
             let mut publication = Publication::from(pub_msg);
             publication.data = data;
             sub.emit(SubEvent::Publication(publication));

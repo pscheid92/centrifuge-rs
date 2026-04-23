@@ -2,7 +2,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::actor::ActorCommand;
 use crate::client::request;
-use crate::config::SubscriptionConfig;
+use crate::config::{ProtocolType, SubscriptionConfig};
 use crate::errors::{CentrifugeError, Result};
 use crate::protocol::{proto, types::*};
 
@@ -205,14 +205,21 @@ impl SubState {
     }
 
     /// Apply delta if negotiated, returning the full data for the publication.
-    /// In JSON mode, embedded_json wraps data values in JSON string encoding.
-    /// We unwrap those before delta operations and rewrap the result.
-    pub fn apply_delta(&mut self, pub_data: &[u8], is_delta: bool) -> Vec<u8> {
+    ///
+    /// In JSON mode, `embedded_json` deserialization re-wraps byte fields as a
+    /// JSON string; we unwrap those before fossil apply or storing as
+    /// `prev_data`. In Protobuf mode, `pub.data` is already raw bytes and must
+    /// be used as-is (unwrapping would corrupt payloads that happen to parse as
+    /// a JSON string literal). Matches the Go SDK split at `subscription.go:546-586`
+    /// and the JS split between `json.ts` and `protobuf.codec.ts`.
+    pub fn apply_delta(&mut self, pub_data: &[u8], is_delta: bool, protocol_type: ProtocolType) -> Vec<u8> {
         if !self.delta_negotiated {
             return pub_data.to_vec();
         }
-        // Unwrap JSON string encoding added by embedded_json deserializer
-        let raw_data = unwrap_json_string(pub_data);
+        let raw_data = match protocol_type {
+            ProtocolType::Json => unwrap_json_string(pub_data),
+            ProtocolType::Protobuf => pub_data.to_vec(),
+        };
         if is_delta {
             match crate::delta::apply_delta(&self.prev_data, &raw_data) {
                 Ok(full_data) => {
@@ -228,5 +235,63 @@ impl SubState {
             self.prev_data = raw_data.clone();
             raw_data
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn negotiated_sub_state() -> SubState {
+        let mut s = SubState::new(SubscriptionConfig::default());
+        s.delta_negotiated = true;
+        s
+    }
+
+    #[test]
+    fn apply_delta_noop_when_not_negotiated() {
+        let mut s = SubState::new(SubscriptionConfig::default());
+        let data = b"\"hello\"";
+        let result = s.apply_delta(data, false, ProtocolType::Protobuf);
+        assert_eq!(result, data);
+        let result = s.apply_delta(data, false, ProtocolType::Json);
+        assert_eq!(result, data);
+        assert!(s.prev_data.is_empty(), "prev_data must not change when delta is not negotiated");
+    }
+
+    // Protobuf raw bytes that happen to form a valid JSON string literal must
+    // be preserved verbatim — unwrapping would corrupt the payload. This path
+    // is what the Go SDK handles at subscription.go:574-584 (the `else` branch
+    // for non-JSON protocol).
+    #[test]
+    fn apply_delta_protobuf_does_not_unwrap_json_looking_bytes() {
+        let mut s = negotiated_sub_state();
+        let data = b"\"hello\"";
+        let result = s.apply_delta(data, false, ProtocolType::Protobuf);
+        assert_eq!(result, data, "protobuf bytes must not be JSON-unwrapped");
+        assert_eq!(s.prev_data, data, "prev_data must store raw bytes verbatim");
+    }
+
+    // JSON mode: embedded_json re-encodes byte fields as JSON strings, so delta
+    // apply and prev_data must operate on the unwrapped form. Matches Go
+    // subscription.go:550-572.
+    #[test]
+    fn apply_delta_json_unwraps_json_string_encoded_data() {
+        let mut s = negotiated_sub_state();
+        let data = b"\"hello\"";
+        let result = s.apply_delta(data, false, ProtocolType::Json);
+        assert_eq!(result, b"hello", "json: must unwrap JSON string wrapping");
+        assert_eq!(s.prev_data, b"hello");
+    }
+
+    // If the JSON codec hands us bytes that aren't a JSON string (e.g. an
+    // object), `unwrap_json_string` is a no-op by design.
+    #[test]
+    fn apply_delta_json_leaves_non_string_json_alone() {
+        let mut s = negotiated_sub_state();
+        let data = br#"{"k":"v"}"#;
+        let result = s.apply_delta(data, false, ProtocolType::Json);
+        assert_eq!(result, data);
+        assert_eq!(s.prev_data, data);
     }
 }
