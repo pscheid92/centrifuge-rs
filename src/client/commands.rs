@@ -208,20 +208,42 @@ impl ConnectionActor {
     }
 
     async fn handle_remove_subscription(&mut self, channel: String, reply: oneshot::Sender<Result<()>>) {
-        if let Some(mut sub) = self.subs.remove(&channel) {
-            if sub.state != SubscriptionState::Unsubscribed && self.state == ClientState::Connected {
-                let id = self.next_cmd_id();
-                let cmd = proto::Command {
-                    id,
-                    unsubscribe: Some(proto::UnsubscribeRequest {
-                        channel: channel.clone(),
-                    }),
-                    ..Default::default()
-                };
-                let _ = self.send_command(&cmd).await;
-            }
+        let Some(mut sub) = self.subs.remove(&channel) else {
+            let _ = reply.send(Ok(()));
+            return;
+        };
+
+        // Spec (client_sdk.md:218): "Subscription is automatically unsubscribed
+        // before being removed." Matches JS SDK (centrifuge.ts:191-200). Skipped
+        // when already Unsubscribed so consumers don't see a duplicate event.
+        let was_subscribed = sub.state == SubscriptionState::Subscribed;
+        if sub.state != SubscriptionState::Unsubscribed {
             sub.state = SubscriptionState::Unsubscribed;
+            sub.resubscribe_attempts = 0;
+            for waiter in sub.subscribe_waiters.drain(..) {
+                let _ = waiter.send(Err(CentrifugeError::SubscriptionUnsubscribed));
+            }
+            sub.emit(SubEvent::Unsubscribed(UnsubscribedContext {
+                code: codes::unsubscribed::UNSUBSCRIBE_CALLED,
+                reason: "unsubscribe called".into(),
+            }));
         }
+
+        // Wire unsubscribe is only meaningful while the server believes we're
+        // subscribed — i.e. the sub was in the Subscribed state. Mirrors the
+        // `was_subscribed && Connected` gate in handle_unsubscribe.
+        if was_subscribed && self.state == ClientState::Connected {
+            let id = self.next_cmd_id();
+            let cmd = proto::Command {
+                id,
+                unsubscribe: Some(proto::UnsubscribeRequest {
+                    channel: channel.clone(),
+                }),
+                ..Default::default()
+            };
+            let _ = self.send_command(&cmd).await;
+        }
+
         let _ = reply.send(Ok(()));
     }
 

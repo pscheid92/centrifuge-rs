@@ -171,6 +171,88 @@ async fn remove_subscription_while_subscribed() {
     assert!(client.get_subscription("ch").await.unwrap().is_none());
 }
 
+// Spec (client_sdk.md:218): "Subscription is automatically unsubscribed before
+// being removed." Matches JS SDK centrifuge.ts:191-200 which calls
+// sub.unsubscribe() (emitting Unsubscribed) before removing from the registry.
+#[tokio::test]
+async fn remove_subscription_while_subscribed_emits_unsubscribed() {
+    let (client, mut conn, _) = make_client(default_config());
+    let sub = client
+        .new_subscription("ch", SubscriptionConfig::default())
+        .await
+        .unwrap();
+    let mut events = sub.events().expect("events");
+    connect_client(&client, &mut conn).await;
+    subscribe_sub(&sub, &mut conn).await;
+
+    // Drain Subscribing + Subscribed from the subscribe flow.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(drain_deadline) => break,
+            _ = events.recv() => {}
+        }
+    }
+
+    client.remove_subscription(&sub).await.unwrap();
+    let cmd = read_command(&mut conn).await;
+    assert!(cmd.get("unsubscribe").is_some(), "wire unsubscribe must still be sent");
+
+    let evt = time::timeout(Duration::from_millis(100), events.recv())
+        .await
+        .expect("Unsubscribed event must arrive before the sub's event channel is dropped")
+        .expect("sub event channel must still be readable");
+    match evt {
+        centrifuge_client::SubEvent::Unsubscribed(ctx) => {
+            assert_eq!(ctx.code, 0, "expected UNSUBSCRIBE_CALLED code (0)");
+        }
+        other => panic!("expected SubEvent::Unsubscribed, got {other:?}"),
+    }
+
+    assert!(client.get_subscription("ch").await.unwrap().is_none());
+}
+
+// If the sub is already Unsubscribed (user called unsubscribe() first), remove
+// must not emit a second Unsubscribed event — matches JS's `if (state !==
+// Unsubscribed) sub.unsubscribe()` guard.
+#[tokio::test]
+async fn remove_subscription_when_already_unsubscribed_is_silent() {
+    let (client, mut conn, _) = make_client(default_config());
+    let sub = client
+        .new_subscription("ch", SubscriptionConfig::default())
+        .await
+        .unwrap();
+    let mut events = sub.events().expect("events");
+    connect_client(&client, &mut conn).await;
+    subscribe_sub(&sub, &mut conn).await;
+
+    // Explicit unsubscribe — this emits one Unsubscribed event.
+    sub.unsubscribe().await.unwrap();
+    // Drain the wire unsubscribe command from the outgoing stream.
+    let _ = read_command(&mut conn).await;
+
+    // Drain all events from the unsubscribe (and the earlier subscribe flow).
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(drain_deadline) => break,
+            _ = events.recv() => {}
+        }
+    }
+
+    client.remove_subscription(&sub).await.unwrap();
+
+    // No further Unsubscribed event — the sub was already in the Unsubscribed
+    // state when remove was called.
+    let evt = time::timeout(Duration::from_millis(50), events.recv()).await;
+    match evt {
+        Err(_) => {}                  // timeout, no event — expected
+        Ok(None) => {}                // channel closed (sub dropped) — also fine
+        Ok(Some(e)) => panic!("unexpected event after remove of already-unsubscribed sub: {e:?}"),
+    }
+    assert!(client.get_subscription("ch").await.unwrap().is_none());
+}
+
 // =========================================================================
 // J. Subscribe before connect (queued subscriptions)
 // =========================================================================
