@@ -256,7 +256,10 @@ mod tests {
         assert_eq!(result, data);
         let result = s.apply_delta(data, false, ProtocolType::Json);
         assert_eq!(result, data);
-        assert!(s.prev_data.is_empty(), "prev_data must not change when delta is not negotiated");
+        assert!(
+            s.prev_data.is_empty(),
+            "prev_data must not change when delta is not negotiated"
+        );
     }
 
     // Protobuf raw bytes that happen to form a valid JSON string literal must

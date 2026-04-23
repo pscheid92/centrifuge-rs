@@ -105,6 +105,74 @@ async fn subscribe_while_already_subscribing_is_idempotent() {
     assert_eq!(subscribed_count, 1, "expected exactly one Subscribed event");
 }
 
+// Resubscribe path (do_subscribe) must schedule a request timeout just like
+// the initial subscribe path (handle_subscribe). Without it, a server that
+// goes silent mid-operation leaves the pending entry wedged until the ping
+// timeout fires ~25+ seconds later.
+//
+// Spec (client_protocol.md:148-150): "the simplest solution is to reconnect
+// entirely" on subscribe timeout. Go wraps every subscribe in sendAsync
+// (client.go:2056-2088) which always arms time.After(ReadTimeout); the
+// subscribe callback at subscription.go:620-623 then calls
+// handleDisconnect(Reconnect: true). JS takes the same disconnect-and-reconnect
+// path at subscription.ts:527-535.
+#[tokio::test]
+async fn resubscribe_timeout_forces_reconnect() {
+    let mut cfg = default_config();
+    cfg.timeout = Duration::from_millis(100);
+    let (client, mut conn, _) = make_client(cfg);
+
+    let sub = client
+        .new_subscription("ch", SubscriptionConfig::default())
+        .await
+        .unwrap();
+    connect_client(&client, &mut conn).await;
+    subscribe_sub(&sub, &mut conn).await;
+
+    // Fresh client-events channel AFTER the initial connect/subscribe so we
+    // only observe events that happen from here on.
+    let mut events = client.events().expect("events");
+
+    // Server unsubscribe push with code >= 2500 → triggers a resubscribe via
+    // the do_subscribe path (not the handle_subscribe path).
+    conn.incoming_tx
+        .send(TransportFrame::Data(encode_reply(&serde_json::json!({
+            "push": {"channel": "ch", "unsubscribe": {"code": 2500, "reason": "retry"}}
+        }))))
+        .await
+        .unwrap();
+
+    // Resubscribe command hits the wire — but we never reply.
+    let cmd = read_command(&mut conn).await;
+    assert!(
+        cmd.get("subscribe").is_some(),
+        "resubscribe must issue a subscribe command on the wire"
+    );
+
+    // After config.timeout, the RequestTimeout handler should fire
+    // on_transport_close(reconnect=true) → move_to_connecting → Connecting
+    // event. Without the fix no timeout is scheduled and we stay Connected.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    let mut saw_connecting = false;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            evt = events.recv() => match evt {
+                Some(centrifuge_client::ClientEvent::Connecting(_)) => {
+                    saw_connecting = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    assert!(
+        saw_connecting,
+        "resubscribe timeout must force reconnect (Connecting event expected)"
+    );
+}
+
 #[tokio::test]
 async fn duplicate_subscription_error() {
     let (client, _conn, _) = make_client(default_config());
@@ -316,8 +384,8 @@ async fn remove_subscription_when_already_unsubscribed_is_silent() {
     // state when remove was called.
     let evt = time::timeout(Duration::from_millis(50), events.recv()).await;
     match evt {
-        Err(_) => {}                  // timeout, no event — expected
-        Ok(None) => {}                // channel closed (sub dropped) — also fine
+        Err(_) => {}   // timeout, no event — expected
+        Ok(None) => {} // channel closed (sub dropped) — also fine
         Ok(Some(e)) => panic!("unexpected event after remove of already-unsubscribed sub: {e:?}"),
     }
     assert!(client.get_subscription("ch").await.unwrap().is_none());

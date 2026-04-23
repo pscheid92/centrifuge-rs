@@ -222,6 +222,13 @@ impl ConnectionActor {
                 sender: tx,
             },
         );
+        // Match handle_subscribe: a wedged server must not leave the pending
+        // entry stuck until the ping timeout. On fire, RequestTimeout drains
+        // subscribe_waiters and calls on_transport_close(reconnect=true),
+        // matching Go's sendAsync + subscribeError (client.go:2063-2086,
+        // subscription.go:620-623) and JS's _handleSubscribeError
+        // (subscription.ts:527-535).
+        self.schedule_request_timeout(id);
 
         if let Err(e) = self.send_command(&cmd).await {
             self.pending.remove(&id);
